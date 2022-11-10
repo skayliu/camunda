@@ -90,8 +90,6 @@ public class CreateProcessInstanceUnsupportedElementTypeTest {
   public static Collection<Object[]> parameters() {
     return Arrays.asList(
         new Object[][] {
-          {BpmnElementType.START_EVENT, "rootStartEvent"},
-          {BpmnElementType.START_EVENT, "subStartEvent"},
           {BpmnElementType.SEQUENCE_FLOW, "sequenceFlow"},
           {BpmnElementType.BOUNDARY_EVENT, "boundaryEvent"},
         });

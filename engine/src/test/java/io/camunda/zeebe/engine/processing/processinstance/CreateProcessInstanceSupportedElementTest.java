@@ -36,6 +36,7 @@ public class CreateProcessInstanceSupportedElementTest {
   private static final String PROCESS_ID = "processId";
   private static final String CHILD_PROCESS_ID = "childProcessId";
   private static final String START_ELEMENT_ID = "startElement";
+  private static final String START_EVENT_ID = "startEvent";
   private static final String MESSAGE = "message";
   private static final String JOBTYPE = "jobtype";
 
@@ -58,7 +59,7 @@ public class CreateProcessInstanceSupportedElementTest {
                 .startEvent()
                 .subProcess(START_ELEMENT_ID)
                 .embeddedSubProcess()
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .subProcessDone()
                 .done(),
             Collections.emptyMap()),
@@ -66,7 +67,8 @@ public class CreateProcessInstanceSupportedElementTest {
             BpmnElementType.EVENT_SUB_PROCESS,
             Bpmn.createExecutableProcess(PROCESS_ID)
                 .eventSubProcess(
-                    START_ELEMENT_ID, e -> e.startEvent().timerWithDuration("PT1H").endEvent())
+                    START_ELEMENT_ID,
+                    e -> e.startEvent(START_EVENT_ID).timerWithDuration("PT1H").endEvent())
                 .startEvent()
                 .endEvent()
                 .done(),
@@ -74,7 +76,7 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.INTERMEDIATE_CATCH_EVENT,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .intermediateCatchEvent(START_ELEMENT_ID)
                 .message(b -> b.name(MESSAGE).zeebeCorrelationKeyExpression("correlationKey"))
                 .done(),
@@ -82,38 +84,44 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.INTERMEDIATE_THROW_EVENT,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .intermediateThrowEvent(START_ELEMENT_ID)
                 .endEvent()
                 .done(),
             Collections.emptyMap()),
         new Scenario(
             BpmnElementType.END_EVENT,
-            Bpmn.createExecutableProcess(PROCESS_ID).startEvent().endEvent(START_ELEMENT_ID).done(),
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .startEvent(START_EVENT_ID)
+                .endEvent(START_ELEMENT_ID)
+                .done(),
             Collections.emptyMap()),
         new Scenario(
             BpmnElementType.SERVICE_TASK,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .serviceTask(START_ELEMENT_ID, b -> b.zeebeJobType(JOBTYPE))
                 .done(),
             Collections.emptyMap()),
         new Scenario(
             BpmnElementType.RECEIVE_TASK,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .receiveTask(START_ELEMENT_ID)
                 .message(b -> b.name(MESSAGE).zeebeCorrelationKeyExpression("correlationKey"))
                 .done(),
             Map.of("correlationKey", "value")),
         new Scenario(
             BpmnElementType.USER_TASK,
-            Bpmn.createExecutableProcess(PROCESS_ID).startEvent().userTask(START_ELEMENT_ID).done(),
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .startEvent(START_EVENT_ID)
+                .userTask(START_ELEMENT_ID)
+                .done(),
             Collections.emptyMap()),
         new Scenario(
             BpmnElementType.MANUAL_TASK,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .manualTask(START_ELEMENT_ID)
                 .endEvent()
                 .done(),
@@ -121,7 +129,7 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.EXCLUSIVE_GATEWAY,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .exclusiveGateway(START_ELEMENT_ID)
                 .defaultFlow()
                 .endEvent()
@@ -130,7 +138,7 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.PARALLEL_GATEWAY,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .parallelGateway(START_ELEMENT_ID)
                 .endEvent()
                 .done(),
@@ -138,7 +146,7 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.EVENT_BASED_GATEWAY,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .eventBasedGateway(START_ELEMENT_ID)
                 .intermediateCatchEvent()
                 .message(b -> b.name(MESSAGE).zeebeCorrelationKeyExpression("correlationKey"))
@@ -150,7 +158,7 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.MULTI_INSTANCE_BODY,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .serviceTask(
                     START_ELEMENT_ID,
                     t ->
@@ -162,7 +170,7 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.CALL_ACTIVITY,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .callActivity(START_ELEMENT_ID, c -> c.zeebeProcessId(CHILD_PROCESS_ID))
                 .endEvent()
                 .done(),
@@ -170,21 +178,21 @@ public class CreateProcessInstanceSupportedElementTest {
         new Scenario(
             BpmnElementType.BUSINESS_RULE_TASK,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .businessRuleTask(START_ELEMENT_ID, b -> b.zeebeJobType(JOBTYPE))
                 .done(),
             Collections.emptyMap()),
         new Scenario(
             BpmnElementType.SCRIPT_TASK,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .scriptTask(START_ELEMENT_ID, b -> b.zeebeJobType(JOBTYPE))
                 .done(),
             Collections.emptyMap()),
         new Scenario(
             BpmnElementType.SEND_TASK,
             Bpmn.createExecutableProcess(PROCESS_ID)
-                .startEvent()
+                .startEvent(START_EVENT_ID)
                 .sendTask(START_ELEMENT_ID, b -> b.zeebeJobType(JOBTYPE))
                 .done(),
             Collections.emptyMap()));
@@ -222,6 +230,49 @@ public class CreateProcessInstanceSupportedElementTest {
             tuple(BpmnElementType.PROCESS, ProcessInstanceIntent.ELEMENT_ACTIVATED),
             tuple(scenario.type, ProcessInstanceIntent.ELEMENT_ACTIVATING),
             tuple(scenario.type, ProcessInstanceIntent.ELEMENT_ACTIVATED));
+  }
+
+  @Test
+  public void testProcessInstanceCanStartAtStartEvent() {
+    // given
+    ENGINE.deployment().withXmlResource(scenario.modelInstance).deploy();
+    if (scenario.type == BpmnElementType.CALL_ACTIVITY) {
+      ENGINE.deployment().withXmlResource(getChildProcess()).deploy();
+    }
+
+    // when
+    final long instanceKey =
+        ENGINE
+            .processInstance()
+            .ofBpmnProcessId(PROCESS_ID)
+            .withStartInstruction(START_EVENT_ID)
+            .withVariables(scenario.variables)
+            .create();
+
+    // then
+    assertThat(
+            RecordingExporter.processInstanceRecords()
+                .withProcessInstanceKey(instanceKey)
+                .onlyEvents()
+                .limit(
+                    r ->
+                        r.getValue().getElementId().equals(START_EVENT_ID)
+                            && r.getIntent() == ProcessInstanceIntent.ELEMENT_ACTIVATED))
+        .extracting(
+            record -> record.getValue().getElementId(),
+            record -> record.getValue().getBpmnElementType(),
+            Record::getIntent)
+        .containsSubsequence(
+            tuple(PROCESS_ID, BpmnElementType.PROCESS, ProcessInstanceIntent.ELEMENT_ACTIVATING),
+            tuple(PROCESS_ID, BpmnElementType.PROCESS, ProcessInstanceIntent.ELEMENT_ACTIVATED),
+            tuple(
+                START_EVENT_ID,
+                BpmnElementType.START_EVENT,
+                ProcessInstanceIntent.ELEMENT_ACTIVATING),
+            tuple(
+                START_EVENT_ID,
+                BpmnElementType.START_EVENT,
+                ProcessInstanceIntent.ELEMENT_ACTIVATED));
   }
 
   private BpmnModelInstance getChildProcess() {

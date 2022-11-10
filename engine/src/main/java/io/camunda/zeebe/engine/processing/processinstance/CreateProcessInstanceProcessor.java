@@ -15,6 +15,7 @@ import io.camunda.zeebe.engine.metrics.ProcessEngineMetrics;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnBehaviors;
 import io.camunda.zeebe.engine.processing.common.ElementActivationBehavior;
 import io.camunda.zeebe.engine.processing.common.EventSubscriptionException;
+import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableActivity;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableFlowElement;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableFlowNode;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableProcess;
@@ -62,7 +63,6 @@ public final class CreateProcessInstanceProcessor
 
   private static final Set<BpmnElementType> UNSUPPORTED_ELEMENT_TYPES =
       Set.of(
-          BpmnElementType.START_EVENT,
           BpmnElementType.SEQUENCE_FLOW,
           BpmnElementType.BOUNDARY_EVENT,
           BpmnElementType.UNSPECIFIED);
@@ -162,8 +162,9 @@ public final class CreateProcessInstanceProcessor
     final var process = deployedProcess.getProcess();
     final var startInstructions = command.startInstructions();
 
-    return validateHasNoneStartEventOrStartInstructions(process, startInstructions)
+    return validateHasStartEventsOrStartInstructions(process, startInstructions)
         .flatMap(valid -> validateElementsExist(process, startInstructions))
+        .flatMap(valid -> validateSubProcessStartEvent(process, startInstructions))
         .flatMap(valid -> validateElementsNotInsideMultiInstance(process, startInstructions))
         .flatMap(valid -> validateTargetsSupportedElementType(process, startInstructions))
         .flatMap(
@@ -171,7 +172,7 @@ public final class CreateProcessInstanceProcessor
         .map(valid -> deployedProcess);
   }
 
-  private Either<Rejection, ?> validateHasNoneStartEventOrStartInstructions(
+  private Either<Rejection, ?> validateHasStartEventsOrStartInstructions(
       final ExecutableProcess process,
       final ArrayProperty<ProcessInstanceCreationStartInstruction> startInstructions) {
 
@@ -271,6 +272,49 @@ public final class CreateProcessInstanceProcessor
                                             !UNSUPPORTED_ELEMENT_TYPES.contains(elementType))
                                     .collect(Collectors.toSet())))))
         .orElse(VALID);
+  }
+
+  private Either<Rejection, ?> validateSubProcessStartEvent(
+      final ExecutableProcess process,
+      final ArrayProperty<ProcessInstanceCreationStartInstruction> startInstructions) {
+
+    return startInstructions.stream()
+        .map(ProcessInstanceCreationStartInstruction::getElementId)
+        .filter(elementId -> isElementSubProcessStartEvent(process, elementId))
+        .findAny()
+        .map(
+            elementId ->
+                Either.left(
+                    new Rejection(
+                        RejectionType.INVALID_ARGUMENT,
+                        "Expected to create instance of process with start instructions but the element with id '%s' of start event belongs to a sub process with boundary event. The creation of start event belonging to a sub process with boundary event is not supported."
+                            .formatted(elementId))))
+        .orElse(VALID);
+  }
+
+  private boolean isElementSubProcessStartEvent(
+      final ExecutableProcess process, final String elementId) {
+    final var element = process.getElementById(wrapString(elementId));
+
+    return element != null
+        && element.getElementType() == BpmnElementType.START_EVENT
+        && hasSubProcessWithBoundaryEvent(process, element);
+  }
+
+  private boolean hasSubProcessWithBoundaryEvent(
+      final ExecutableProcess process, final ExecutableFlowElement flowElement) {
+    final var flowScope = flowElement.getFlowScope();
+    if (flowScope == null) {
+      return false;
+    }
+
+    if (flowScope.getElementType() == BpmnElementType.SUB_PROCESS) {
+      final ExecutableActivity subProcess =
+          process.getElementById(flowScope.getId(), ExecutableActivity.class);
+      return subProcess.getBoundaryEvents().size() > 0;
+    } else {
+      return hasSubProcessWithBoundaryEvent(process, flowScope);
+    }
   }
 
   private Either<Rejection, ?> validateElementNotBelongingToEventBasedGateway(

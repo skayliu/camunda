@@ -233,4 +233,70 @@ public class CreateProcessInstanceRejectionTest {
         .hasIntent(ProcessInstanceCreationIntent.CREATE)
         .hasRejectionType(RejectionType.EXCEEDED_BATCH_RECORD_SIZE);
   }
+
+  @Test
+  public void shouldRejectCommandIfSubProcessStartEventWithBoundaryEvents() {
+    // given
+    engine
+        .deployment()
+        .withXmlResource(
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .startEvent()
+                .subProcess(
+                    "subprocess",
+                    subprocess -> {
+                      subprocess
+                          .embeddedSubProcess()
+                          .startEvent("sub_start")
+                          .serviceTask("task", t -> t.zeebeJobType("task"))
+                          .endEvent();
+
+                      subprocess
+                          .boundaryEvent("message-boundary-event")
+                          .cancelActivity(false)
+                          .message(m -> m.name("msg").zeebeCorrelationKeyExpression("key"))
+                          .endEvent();
+
+                      subprocess
+                          .boundaryEvent("timer-boundary-event")
+                          .cancelActivity(false)
+                          .timerWithCycle("R1/PT1H")
+                          .endEvent();
+                    })
+                .endEvent()
+                .done())
+        .deploy();
+
+    // when
+    engine
+        .processInstance()
+        .ofBpmnProcessId(PROCESS_ID)
+        .withStartInstruction("sub_start")
+        .expectRejection()
+        .create();
+
+    // then
+    assertThat(
+            RecordingExporter.processInstanceCreationRecords()
+                .withBpmnProcessId(PROCESS_ID)
+                .withStartInstruction("sub_start")
+                .onlyCommandRejections()
+                .getFirst())
+        .hasIntent(ProcessInstanceCreationIntent.CREATE)
+        .hasRejectionType(RejectionType.INVALID_ARGUMENT)
+        .hasRejectionReason(
+            "Expected to create instance of process with start instructions but the element with id 'sub_start' of start event belongs to a sub process with boundary event. The creation of start event belonging to a sub process with boundary event is not supported.");
+
+    Assertions.assertThat(
+            RecordingExporter.records()
+                .limit(
+                    r ->
+                        r.getRecordType() == RecordType.COMMAND_REJECTION
+                            && r.getIntent() == ProcessInstanceCreationIntent.CREATE))
+        .extracting(Record::getValueType, Record::getIntent)
+        .describedAs("Expect that no process instance is activated")
+        .doesNotContain(
+            tuple(ValueType.PROCESS_INSTANCE, ProcessInstanceIntent.ELEMENT_ACTIVATING),
+            tuple(ValueType.PROCESS_INSTANCE, ProcessInstanceIntent.ELEMENT_ACTIVATED));
+  }
 }
