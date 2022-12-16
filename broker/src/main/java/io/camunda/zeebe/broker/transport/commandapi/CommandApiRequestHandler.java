@@ -12,9 +12,10 @@ import io.camunda.zeebe.broker.transport.AsyncApiRequestHandler;
 import io.camunda.zeebe.broker.transport.ErrorResponseWriter;
 import io.camunda.zeebe.broker.transport.backpressure.BackpressureMetrics;
 import io.camunda.zeebe.broker.transport.backpressure.RequestLimiter;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
-import io.camunda.zeebe.msgpack.UnpackedObject;
+import io.camunda.zeebe.logstreams.log.LogAppendEntry;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
 import io.camunda.zeebe.protocol.impl.record.RecordMetadata;
+import io.camunda.zeebe.protocol.impl.record.UnifiedRecordValue;
 import io.camunda.zeebe.protocol.record.ExecuteCommandRequestDecoder;
 import io.camunda.zeebe.protocol.record.RecordType;
 import io.camunda.zeebe.protocol.record.intent.Intent;
@@ -28,7 +29,7 @@ final class CommandApiRequestHandler
     extends AsyncApiRequestHandler<CommandApiRequestReader, CommandApiResponseWriter> {
   private static final Logger LOG = Loggers.TRANSPORT_LOGGER;
 
-  private final Int2ObjectHashMap<LogStreamRecordWriter> leadingStreams = new Int2ObjectHashMap<>();
+  private final Int2ObjectHashMap<LogStreamWriter> leadingStreams = new Int2ObjectHashMap<>();
   private final Int2ObjectHashMap<RequestLimiter<Intent>> partitionLimiters =
       new Int2ObjectHashMap<>();
   private final BackpressureMetrics metrics = new BackpressureMetrics();
@@ -74,25 +75,25 @@ final class CommandApiRequestHandler
     final var logStreamWriter = leadingStreams.get(partitionId);
     final var limiter = partitionLimiters.get(partitionId);
 
-    final var eventType = command.valueType();
-    final var intent = Intent.fromProtocolValue(eventType, command.intent());
-    final var event = reader.event();
+    final var valueType = command.valueType();
+    final var intent = Intent.fromProtocolValue(valueType, command.intent());
+    final var value = reader.value();
     final var metadata = reader.metadata();
 
     metadata.requestId(requestId);
     metadata.requestStreamId(partitionId);
     metadata.recordType(RecordType.COMMAND);
     metadata.intent(intent);
-    metadata.valueType(eventType);
+    metadata.valueType(valueType);
 
     if (logStreamWriter == null) {
       errorWriter.partitionLeaderMismatch(partitionId);
       return Either.left(errorWriter);
     }
 
-    if (event == null) {
+    if (value == null) {
       errorWriter.unsupportedMessage(
-          eventType.name(), CommandApiRequestReader.RECORDS_BY_TYPE.keySet().toArray());
+          valueType.name(), CommandApiRequestReader.RECORDS_BY_TYPE.keySet().toArray());
       return Either.left(errorWriter);
     }
 
@@ -111,7 +112,7 @@ final class CommandApiRequestHandler
 
     boolean written = false;
     try {
-      written = writeCommand(command.key(), metadata, event, logStreamWriter);
+      written = writeCommand(command.key(), metadata, value, logStreamWriter);
       return Either.right(responseWriter);
     } catch (final Exception ex) {
       LOG.error("Unexpected error on writing {} command", intent, ex);
@@ -126,26 +127,22 @@ final class CommandApiRequestHandler
 
   private boolean writeCommand(
       final long key,
-      final RecordMetadata eventMetadata,
-      final UnpackedObject event,
-      final LogStreamRecordWriter logStreamWriter) {
-    logStreamWriter.reset();
-
+      final RecordMetadata metadata,
+      final UnifiedRecordValue value,
+      final LogStreamWriter logStreamWriter) {
+    final LogAppendEntry appendEntry;
     if (key != ExecuteCommandRequestDecoder.keyNullValue()) {
-      logStreamWriter.key(key);
+      appendEntry = LogAppendEntry.of(key, metadata, value);
     } else {
-      logStreamWriter.keyNull();
+      appendEntry = LogAppendEntry.of(metadata, value);
     }
 
-    final long eventPosition =
-        logStreamWriter.metadataWriter(eventMetadata).valueWriter(event).tryWrite();
-
-    return eventPosition >= 0;
+    return logStreamWriter.tryWrite(appendEntry) >= 0;
   }
 
   void addPartition(
       final int partitionId,
-      final LogStreamRecordWriter logStreamWriter,
+      final LogStreamWriter logStreamWriter,
       final RequestLimiter<Intent> limiter) {
     actor.submit(
         () -> {

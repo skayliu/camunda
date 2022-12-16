@@ -11,7 +11,6 @@ import static io.camunda.zeebe.protocol.record.ExecuteCommandResponseEncoder.key
 import static io.camunda.zeebe.protocol.record.ExecuteCommandResponseEncoder.partitionIdNullValue;
 import static io.camunda.zeebe.protocol.record.ExecuteCommandResponseEncoder.valueHeaderLength;
 
-import io.camunda.zeebe.engine.api.CommandResponseWriter;
 import io.camunda.zeebe.protocol.Protocol;
 import io.camunda.zeebe.protocol.record.ExecuteCommandResponseEncoder;
 import io.camunda.zeebe.protocol.record.MessageHeaderEncoder;
@@ -19,6 +18,7 @@ import io.camunda.zeebe.protocol.record.RecordType;
 import io.camunda.zeebe.protocol.record.RejectionType;
 import io.camunda.zeebe.protocol.record.ValueType;
 import io.camunda.zeebe.protocol.record.intent.Intent;
+import io.camunda.zeebe.stream.api.CommandResponseWriter;
 import io.camunda.zeebe.transport.ServerOutput;
 import io.camunda.zeebe.transport.impl.ServerResponseImpl;
 import io.camunda.zeebe.util.buffer.BufferWriter;
@@ -142,13 +142,13 @@ public final class CommandResponseWriterImpl implements CommandResponseWriter, B
 
     offset = responseEncoder.limit();
 
-    final int eventLength = valueWriter.getLength();
-    buffer.putInt(offset, eventLength, Protocol.ENDIANNESS);
+    final int valueLength = valueWriter.getLength();
+    buffer.putInt(offset, valueLength, Protocol.ENDIANNESS);
 
     offset += valueHeaderLength();
     valueWriter.write(buffer, offset);
 
-    offset += eventLength;
+    offset += valueLength;
 
     responseEncoder.limit(offset);
     responseEncoder.putRejectionReason(rejectionReason, 0, rejectionReason.capacity());

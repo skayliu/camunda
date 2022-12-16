@@ -7,12 +7,15 @@
  */
 package io.camunda.zeebe.broker.transport.backupapi;
 
+import io.camunda.zeebe.backup.api.BackupDescriptor;
 import io.camunda.zeebe.backup.api.BackupManager;
 import io.camunda.zeebe.backup.api.BackupStatus;
 import io.camunda.zeebe.broker.system.monitoring.DiskSpaceUsageListener;
 import io.camunda.zeebe.broker.transport.AsyncApiRequestHandler;
 import io.camunda.zeebe.broker.transport.ErrorResponseWriter;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
+import io.camunda.zeebe.logstreams.log.LogAppendEntry;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
+import io.camunda.zeebe.protocol.impl.encoding.BackupListResponse;
 import io.camunda.zeebe.protocol.impl.encoding.BackupStatusResponse;
 import io.camunda.zeebe.protocol.impl.record.RecordMetadata;
 import io.camunda.zeebe.protocol.impl.record.value.management.CheckpointRecord;
@@ -28,6 +31,8 @@ import io.camunda.zeebe.scheduler.future.CompletableActorFuture;
 import io.camunda.zeebe.transport.RequestType;
 import io.camunda.zeebe.transport.impl.AtomixServerTransport;
 import io.camunda.zeebe.util.Either;
+import java.time.Instant;
+import java.util.Collection;
 
 /**
  * Request handler to handle commands and queries related to the backup ({@link RequestType#BACKUP})
@@ -36,7 +41,7 @@ public final class BackupApiRequestHandler
     extends AsyncApiRequestHandler<BackupApiRequestReader, BackupApiResponseWriter>
     implements DiskSpaceUsageListener {
   private boolean isDiskSpaceAvailable = true;
-  private final LogStreamRecordWriter logStreamRecordWriter;
+  private final LogStreamWriter logStreamWriter;
   private final BackupManager backupManager;
   private final AtomixServerTransport transport;
   private final int partitionId;
@@ -44,12 +49,12 @@ public final class BackupApiRequestHandler
 
   public BackupApiRequestHandler(
       final AtomixServerTransport transport,
-      final LogStreamRecordWriter logStreamRecordWriter,
+      final LogStreamWriter logStreamWriter,
       final BackupManager backupManager,
       final int partitionId,
       final boolean backupFeatureEnabled) {
     super(BackupApiRequestReader::new, BackupApiResponseWriter::new);
-    this.logStreamRecordWriter = logStreamRecordWriter;
+    this.logStreamWriter = logStreamWriter;
     this.transport = transport;
     this.backupManager = backupManager;
     this.partitionId = partitionId;
@@ -82,7 +87,9 @@ public final class BackupApiRequestHandler
       case TAKE_BACKUP -> CompletableActorFuture.completed(
           handleTakeBackupRequest(
               requestStreamId, requestId, requestReader, responseWriter, errorWriter));
-      case QUERY_STATUS -> handleQueryStatusHandler(requestReader, responseWriter, errorWriter);
+      case QUERY_STATUS -> handleQueryStatusRequest(requestReader, responseWriter, errorWriter);
+      case LIST -> handleListBackupRequest(responseWriter, errorWriter);
+      case DELETE -> handleDeleteBackupRequest(requestReader, responseWriter, errorWriter);
       default -> CompletableActorFuture.completed(
           unknownRequest(errorWriter, requestReader.getMessageDecoder().type()));
     };
@@ -105,11 +112,8 @@ public final class BackupApiRequestHandler
             .intent(CheckpointIntent.CREATE)
             .requestId(requestId)
             .requestStreamId(requestStreamId);
-    final CheckpointRecord checkpointRecord =
-        new CheckpointRecord().setCheckpointId(requestReader.backupId());
-
-    final var written =
-        logStreamRecordWriter.metadataWriter(metadata).valueWriter(checkpointRecord).tryWrite();
+    final var checkpointRecord = new CheckpointRecord().setCheckpointId(requestReader.backupId());
+    final var written = logStreamWriter.tryWrite(LogAppendEntry.of(metadata, checkpointRecord));
 
     if (written > 0) {
       // Response will be sent by the processor
@@ -120,7 +124,7 @@ public final class BackupApiRequestHandler
   }
 
   private ActorFuture<Either<ErrorResponseWriter, BackupApiResponseWriter>>
-      handleQueryStatusHandler(
+      handleQueryStatusRequest(
           final BackupApiRequestReader requestReader,
           final BackupApiResponseWriter responseWriter,
           final ErrorResponseWriter errorWriter) {
@@ -140,6 +144,72 @@ public final class BackupApiRequestHandler
               }
             });
     return result;
+  }
+
+  private ActorFuture<Either<ErrorResponseWriter, BackupApiResponseWriter>> handleListBackupRequest(
+      final BackupApiResponseWriter responseWriter, final ErrorResponseWriter errorWriter) {
+    final ActorFuture<Either<ErrorResponseWriter, BackupApiResponseWriter>> result =
+        new CompletableActorFuture<>();
+
+    backupManager
+        .listBackups()
+        .onComplete(
+            (backups, error) -> {
+              if (error == null) {
+                result.complete(
+                    Either.right(responseWriter.withBackupList(buildBackupListResponse(backups))));
+              } else {
+                result.complete(
+                    Either.left(
+                        errorWriter
+                            .errorCode(ErrorCode.INTERNAL_ERROR)
+                            .errorMessage(error.getMessage())));
+              }
+            });
+    return result;
+  }
+
+  private ActorFuture<Either<ErrorResponseWriter, BackupApiResponseWriter>>
+      handleDeleteBackupRequest(
+          final BackupApiRequestReader requestReader,
+          final BackupApiResponseWriter responseWriter,
+          final ErrorResponseWriter errorWriter) {
+    final ActorFuture<Either<ErrorResponseWriter, BackupApiResponseWriter>> result =
+        new CompletableActorFuture<>();
+    final var backupId = requestReader.backupId();
+    backupManager
+        .deleteBackup(backupId)
+        .onComplete(
+            (ignore, error) -> {
+              if (error == null) {
+                final BackupStatusResponse response =
+                    new BackupStatusResponse()
+                        .setBackupId(backupId)
+                        .setStatus(BackupStatusCode.DOES_NOT_EXIST)
+                        .setPartitionId(requestReader.partitionId());
+                result.complete(Either.right(responseWriter.withStatus(response)));
+              } else {
+                errorWriter.errorCode(ErrorCode.INTERNAL_ERROR).errorMessage(error.getMessage());
+                result.complete(Either.left(errorWriter));
+              }
+            });
+    return result;
+  }
+
+  private BackupListResponse buildBackupListResponse(final Collection<BackupStatus> backups) {
+    final var statuses =
+        backups.stream()
+            .map(
+                backup ->
+                    new BackupListResponse.BackupStatus(
+                        backup.id().checkpointId(),
+                        backup.id().partitionId(),
+                        encodeStatusCode(backup.statusCode()),
+                        backup.failureReason().orElse(""),
+                        backup.descriptor().map(BackupDescriptor::brokerVersion).orElse(""),
+                        backup.created().map(Instant::toString).orElse("")))
+            .toList();
+    return new BackupListResponse(statuses);
   }
 
   private BackupStatusResponse buildResponse(final BackupStatus status) {

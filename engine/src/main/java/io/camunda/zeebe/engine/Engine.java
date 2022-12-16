@@ -7,13 +7,6 @@
  */
 package io.camunda.zeebe.engine;
 
-import io.camunda.zeebe.engine.api.EmptyProcessingResult;
-import io.camunda.zeebe.engine.api.ProcessingResult;
-import io.camunda.zeebe.engine.api.ProcessingResultBuilder;
-import io.camunda.zeebe.engine.api.RecordProcessor;
-import io.camunda.zeebe.engine.api.RecordProcessorContext;
-import io.camunda.zeebe.engine.api.TypedRecord;
-import io.camunda.zeebe.engine.api.records.RecordBatch.ExceededBatchRecordSizeException;
 import io.camunda.zeebe.engine.processing.streamprocessor.RecordProcessorMap;
 import io.camunda.zeebe.engine.processing.streamprocessor.TypedRecordProcessor;
 import io.camunda.zeebe.engine.processing.streamprocessor.TypedRecordProcessor.ProcessingError;
@@ -23,13 +16,20 @@ import io.camunda.zeebe.engine.processing.streamprocessor.TypedRecordProcessors;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.Writers;
 import io.camunda.zeebe.engine.state.EventApplier;
 import io.camunda.zeebe.engine.state.ZeebeDbState;
+import io.camunda.zeebe.engine.state.appliers.EventAppliers;
 import io.camunda.zeebe.engine.state.processing.DbBlackListState;
-import io.camunda.zeebe.logstreams.impl.Loggers;
 import io.camunda.zeebe.protocol.impl.record.value.error.ErrorRecord;
 import io.camunda.zeebe.protocol.record.RejectionType;
 import io.camunda.zeebe.protocol.record.ValueType;
 import io.camunda.zeebe.protocol.record.intent.ErrorIntent;
 import io.camunda.zeebe.protocol.record.value.ProcessInstanceRelated;
+import io.camunda.zeebe.stream.api.EmptyProcessingResult;
+import io.camunda.zeebe.stream.api.ProcessingResult;
+import io.camunda.zeebe.stream.api.ProcessingResultBuilder;
+import io.camunda.zeebe.stream.api.RecordProcessor;
+import io.camunda.zeebe.stream.api.RecordProcessorContext;
+import io.camunda.zeebe.stream.api.records.ExceededBatchRecordSizeException;
+import io.camunda.zeebe.stream.api.records.TypedRecord;
 import java.util.EnumSet;
 import java.util.Objects;
 import java.util.function.Supplier;
@@ -37,7 +37,7 @@ import org.slf4j.Logger;
 
 public class Engine implements RecordProcessor {
 
-  private static final Logger LOG = Loggers.PROCESSOR_LOGGER;
+  private static final Logger LOG = Loggers.PROCESS_PROCESSOR_LOGGER;
   private static final String ERROR_MESSAGE_PROCESSOR_NOT_FOUND =
       "Expected to find processor for record '{}', but caught an exception. Skip this record.";
   private static final String ERROR_MESSAGE_PROCESSING_EXCEPTION_OCCURRED =
@@ -72,7 +72,7 @@ public class Engine implements RecordProcessor {
             recordProcessorContext.getZeebeDb(),
             recordProcessorContext.getTransactionContext(),
             recordProcessorContext.getKeyGenerator());
-    eventApplier = recordProcessorContext.getEventApplierFactory().apply(zeebeState);
+    eventApplier = new EventAppliers(zeebeState);
 
     writers = new Writers(resultBuilderMutex, eventApplier);
 

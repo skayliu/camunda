@@ -12,15 +12,17 @@ import io.camunda.zeebe.backup.processing.state.CheckpointState;
 import io.camunda.zeebe.broker.Loggers;
 import io.camunda.zeebe.broker.protocol.InterPartitionMessageDecoder;
 import io.camunda.zeebe.broker.protocol.MessageHeaderDecoder;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
+import io.camunda.zeebe.logstreams.log.LogAppendEntry;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
 import io.camunda.zeebe.protocol.impl.record.RecordMetadata;
+import io.camunda.zeebe.protocol.impl.record.UnifiedRecordValue;
 import io.camunda.zeebe.protocol.impl.record.value.management.CheckpointRecord;
 import io.camunda.zeebe.protocol.record.RecordType;
 import io.camunda.zeebe.protocol.record.ValueType;
 import io.camunda.zeebe.protocol.record.intent.Intent;
 import io.camunda.zeebe.protocol.record.intent.management.CheckpointIntent;
-import io.camunda.zeebe.util.buffer.BufferWriter;
-import io.camunda.zeebe.util.buffer.DirectBufferWriter;
+import io.camunda.zeebe.stream.impl.TypedEventRegistry;
+import io.camunda.zeebe.util.ReflectUtil;
 import java.util.Optional;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.slf4j.Logger;
@@ -28,11 +30,11 @@ import org.slf4j.Logger;
 final class InterPartitionCommandReceiverImpl {
   private static final Logger LOG = Loggers.TRANSPORT_LOGGER;
   private final Decoder decoder = new Decoder();
-  private final LogStreamRecordWriter logStreamWriter;
+  private final LogStreamWriter logStreamWriter;
   private boolean diskSpaceAvailable = true;
   private long checkpointId = CheckpointState.NO_CHECKPOINT;
 
-  InterPartitionCommandReceiverImpl(final LogStreamRecordWriter logStreamWriter) {
+  InterPartitionCommandReceiverImpl(final LogStreamWriter logStreamWriter) {
     this.logStreamWriter = logStreamWriter;
   }
 
@@ -81,26 +83,23 @@ final class InterPartitionCommandReceiverImpl {
         "Received command with checkpoint {}, current checkpoint is {}",
         decoded.checkpointId,
         checkpointId);
-    logStreamWriter.reset();
     final var metadata =
         new RecordMetadata()
             .recordType(RecordType.COMMAND)
             .intent(CheckpointIntent.CREATE)
             .valueType(ValueType.CHECKPOINT);
     final var checkpointRecord = new CheckpointRecord().setCheckpointId(decoded.checkpointId);
-    final var writeResult =
-        logStreamWriter.metadataWriter(metadata).valueWriter(checkpointRecord).tryWrite();
-    return writeResult > 0;
+    return logStreamWriter.tryWrite(LogAppendEntry.of(metadata, checkpointRecord)) >= 0;
   }
 
   private boolean writeCommand(final DecodedMessage decoded) {
-    logStreamWriter.reset();
+    final var appendEntry =
+        decoded
+            .recordKey()
+            .map(key -> LogAppendEntry.of(key, decoded.metadata(), decoded.command()))
+            .orElseGet(() -> LogAppendEntry.of(decoded.metadata(), decoded.command()));
 
-    decoded.recordKey.ifPresent(logStreamWriter::key);
-
-    final var writeResult =
-        logStreamWriter.metadataWriter(decoded.metadata).valueWriter(decoded.command).tryWrite();
-    return writeResult > 0;
+    return logStreamWriter.tryWrite(appendEntry) >= 0;
   }
 
   void setDiskSpaceAvailable(final boolean available) {
@@ -112,16 +111,19 @@ final class InterPartitionCommandReceiverImpl {
   }
 
   private record DecodedMessage(
-      long checkpointId, Optional<Long> recordKey, RecordMetadata metadata, BufferWriter command) {}
+      long checkpointId,
+      Optional<Long> recordKey,
+      RecordMetadata metadata,
+      UnifiedRecordValue command) {}
 
   private static final class Decoder {
-    private final UnsafeBuffer messageBuffer = new UnsafeBuffer();
-    private final RecordMetadata recordMetadata = new RecordMetadata();
     private final InterPartitionMessageDecoder messageDecoder = new InterPartitionMessageDecoder();
     private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
-    private final DirectBufferWriter commandBuffer = new DirectBufferWriter();
 
     DecodedMessage decodeMessage(final byte[] message) {
+      final var messageBuffer = new UnsafeBuffer();
+      final var recordMetadata = new RecordMetadata();
+
       messageBuffer.wrap(message);
       messageDecoder.wrapAndApplyHeader(messageBuffer, 0, headerDecoder);
 
@@ -143,9 +145,16 @@ final class InterPartitionCommandReceiverImpl {
       final var commandOffset =
           messageDecoder.limit() + InterPartitionMessageDecoder.commandHeaderLength();
       final var commandLength = messageDecoder.commandLength();
-      commandBuffer.wrap(messageBuffer, commandOffset, commandLength);
 
-      return new DecodedMessage(checkpointId, recordKey, recordMetadata, commandBuffer);
+      final var valueClass = TypedEventRegistry.EVENT_REGISTRY.get(valueType);
+      if (valueClass == null) {
+        throw new IllegalArgumentException(
+            "No value type mapped to %s, can't decode message".formatted(valueType));
+      }
+      final var value = ReflectUtil.newInstance(valueClass);
+
+      value.wrap(messageBuffer, commandOffset, commandLength);
+      return new DecodedMessage(checkpointId, recordKey, recordMetadata, value);
     }
   }
 }

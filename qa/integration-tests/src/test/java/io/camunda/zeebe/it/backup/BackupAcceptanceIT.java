@@ -8,17 +8,19 @@
 package io.camunda.zeebe.it.backup;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.camunda.zeebe.backup.s3.S3BackupConfig;
+import feign.FeignException;
+import io.camunda.zeebe.backup.s3.S3BackupConfig.Builder;
 import io.camunda.zeebe.backup.s3.S3BackupStore;
-import io.camunda.zeebe.gateway.admin.backup.BackupStatus;
-import io.camunda.zeebe.gateway.admin.backup.PartitionBackupStatus;
-import io.camunda.zeebe.protocol.management.BackupStatusCode;
 import io.camunda.zeebe.qa.util.actuator.BackupActuator;
-import io.camunda.zeebe.qa.util.actuator.BackupActuator.TakeBackupResponse;
 import io.camunda.zeebe.qa.util.testcontainers.ContainerLogsDumper;
 import io.camunda.zeebe.qa.util.testcontainers.MinioContainer;
 import io.camunda.zeebe.qa.util.testcontainers.ZeebeTestContainerDefaults;
+import io.camunda.zeebe.shared.management.openapi.models.BackupInfo;
+import io.camunda.zeebe.shared.management.openapi.models.PartitionBackupInfo;
+import io.camunda.zeebe.shared.management.openapi.models.StateCode;
+import io.camunda.zeebe.shared.management.openapi.models.TakeBackupResponse;
 import io.camunda.zeebe.test.util.socket.SocketUtil;
 import io.zeebe.containers.ZeebeBrokerNode;
 import io.zeebe.containers.ZeebeNode;
@@ -28,6 +30,8 @@ import io.zeebe.containers.engine.ContainerEngine;
 import java.time.Duration;
 import org.agrona.CloseHelper;
 import org.apache.commons.lang3.RandomStringUtils;
+import org.assertj.core.api.InstanceOfAssertFactories;
+import org.assertj.core.groups.Tuple;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -94,14 +98,14 @@ final class BackupAcceptanceIT {
   @BeforeEach
   void beforeEach() {
     final var config =
-        S3BackupConfig.from(
-            bucketName,
-            minio.externalEndpoint(),
-            minio.region(),
-            minio.accessKey(),
-            minio.secretKey(),
-            Duration.ofSeconds(25),
-            true);
+        new Builder()
+            .withBucketName(bucketName)
+            .withEndpoint(minio.externalEndpoint())
+            .withRegion(minio.region())
+            .withCredentials(minio.accessKey(), minio.secretKey())
+            .withApiCallTimeout(Duration.ofSeconds(25))
+            .forcePathStyleAccess(true)
+            .build();
     store = new S3BackupStore(config);
 
     try (final var client = S3BackupStore.buildClient(config)) {
@@ -123,22 +127,74 @@ final class BackupAcceptanceIT {
     }
 
     // when
-    final var response = actuator.take(1L);
+    final var response = actuator.take(1);
 
     // then
-    assertThat(response).isEqualTo(new TakeBackupResponse(1L));
-    Awaitility.await("until a backup exists with the given ID")
+    assertThat(response).isInstanceOf(TakeBackupResponse.class);
+    waitUntilBackupIsCompleted(actuator, 1L);
+  }
+
+  private static void waitUntilBackupIsCompleted(
+      final BackupActuator actuator, final long backupId) {
+    Awaitility.await("until a backup exists with the id %d".formatted(backupId))
         .atMost(Duration.ofSeconds(30))
+        .ignoreExceptions() // 404 NOT_FOUND throws exception
         .untilAsserted(
             () -> {
-              final var status = actuator.status(response.id());
+              final var status = actuator.status(backupId);
               assertThat(status)
-                  .extracting(BackupStatus::backupId, BackupStatus::status)
-                  .containsExactly(1L, BackupStatusCode.COMPLETED);
-              assertThat(status.partitions())
-                  .flatExtracting(PartitionBackupStatus::partitionId)
+                  .extracting(BackupInfo::getBackupId, BackupInfo::getState)
+                  .containsExactly(backupId, StateCode.COMPLETED);
+              assertThat(status.getDetails())
+                  .flatExtracting(PartitionBackupInfo::getPartitionId)
                   .containsExactlyInAnyOrder(1, 2);
             });
+  }
+
+  @Test
+  void shouldListBackups() {
+    // given
+    final var actuator = BackupActuator.of(cluster.getAvailableGateway());
+    try (final var client = engine.createClient()) {
+      client.newPublishMessageCommand().messageName("name").correlationKey("key").send().join();
+    }
+
+    // when
+    actuator.take(1);
+    actuator.take(2);
+
+    waitUntilBackupIsCompleted(actuator, 1L);
+    waitUntilBackupIsCompleted(actuator, 2L);
+
+    // then
+    final var status = actuator.list();
+    assertThat(status)
+        .hasSize(2)
+        .extracting(BackupInfo::getBackupId, BackupInfo::getState)
+        .containsExactly(
+            Tuple.tuple(1L, StateCode.COMPLETED), Tuple.tuple(2L, StateCode.COMPLETED));
+  }
+
+  @Test
+  void shouldDeleteBackup() {
+    // given
+    final var actuator = BackupActuator.of(cluster.getAvailableGateway());
+    final long backupId = 1;
+    actuator.take(backupId);
+    waitUntilBackupIsCompleted(actuator, backupId);
+
+    // when
+    actuator.delete(backupId);
+
+    // then
+    Awaitility.await("Backup is deleted")
+        .timeout(Duration.ofSeconds(10))
+        .untilAsserted(
+            () ->
+                assertThatThrownBy(() -> actuator.status(backupId))
+                    .asInstanceOf(InstanceOfAssertFactories.type(FeignException.class))
+                    .extracting(FeignException::status)
+                    .isEqualTo(404));
   }
 
   private void configureBroker(final ZeebeBrokerNode<?> broker) {

@@ -350,12 +350,19 @@ public final class ExporterDirectorTest {
     // then
     doRepeatedly(() -> rule.getClock().addTime(Duration.ofSeconds(1)))
         .until((r) -> failCount.get() <= -2);
-    assertThat(exporters.get(0).getExportedRecords())
-        .extracting(Record::getPosition)
-        .containsExactly(eventPosition1, eventPosition2);
-    assertThat(exporters.get(1).getExportedRecords())
-        .extracting(Record::getPosition)
-        .containsExactly(eventPosition1, eventPosition2);
+
+    Awaitility.await("Exporter %s has exported all records".formatted(EXPORTER_ID_1))
+        .untilAsserted(
+            () ->
+                assertThat(exporters.get(0).getExportedRecords())
+                    .extracting(Record::getPosition)
+                    .containsExactly(eventPosition1, eventPosition2));
+    Awaitility.await("Exporter %s has exported all records".formatted(EXPORTER_ID_2))
+        .untilAsserted(
+            () ->
+                assertThat(exporters.get(1).getExportedRecords())
+                    .extracting(Record::getPosition)
+                    .containsExactly(eventPosition1, eventPosition2));
   }
 
   @Test
@@ -478,6 +485,45 @@ public final class ExporterDirectorTest {
         .extracting(Record::getPosition)
         .hasSize(1)
         .contains(eventPosition2);
+  }
+
+  @Test
+  public void shouldRecoverMetadataFromState() throws Exception {
+    // given
+    startExporterDirector(exporterDescriptors);
+
+    final long eventPosition1 = writeEvent();
+    final long eventPosition2 = writeEvent();
+    final var exporterMetadata1 = "e1".getBytes();
+    final var exporterMetadata2 = "e2".getBytes();
+
+    Awaitility.await("wait until the exporters read the records")
+        .until(
+            () ->
+                exporters.get(0).getExportedRecords().size() == 2
+                    && exporters.get(1).getExportedRecords().size() == 2);
+
+    exporters
+        .get(0)
+        .getController()
+        .updateLastExportedRecordPosition(eventPosition2, exporterMetadata1);
+    exporters
+        .get(1)
+        .getController()
+        .updateLastExportedRecordPosition(eventPosition1, exporterMetadata2);
+
+    rule.closeExporterDirector();
+    exporters.get(0).getExportedRecords().clear();
+    exporters.get(1).getExportedRecords().clear();
+
+    // then
+    startExporterDirector(exporterDescriptors);
+    Awaitility.await("wait until the exporters are opened")
+        .until(() -> exporters.get(1).getExportedRecords().size() >= 1);
+
+    // then
+    assertThat(exporters.get(0).getController().readMetadata()).hasValue(exporterMetadata1);
+    assertThat(exporters.get(1).getController().readMetadata()).hasValue(exporterMetadata2);
   }
 
   @Test

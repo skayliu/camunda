@@ -20,6 +20,9 @@ public class S3BackupStoreConfig implements ConfigurationEntry {
   private String secretKey;
   private Duration apiCallTimeout = Duration.ofSeconds(180);
   private boolean forcePathStyleAccess = false;
+  private String compression;
+
+  private String basePath;
 
   public String getBucketName() {
     return bucketName;
@@ -77,6 +80,26 @@ public class S3BackupStoreConfig implements ConfigurationEntry {
     this.forcePathStyleAccess = forcePathStyleAccess;
   }
 
+  public String getCompression() {
+    return compression;
+  }
+
+  public void setCompression(final String algorithm) {
+    if (Objects.equals(algorithm, "none")) {
+      this.compression = null;
+    } else {
+      this.compression = algorithm;
+    }
+  }
+
+  public void setBasePath(final String basePath) {
+    this.basePath = basePath;
+  }
+
+  public String getBasePath() {
+    return basePath;
+  }
+
   @Override
   public int hashCode() {
     int result = bucketName != null ? bucketName.hashCode() : 0;
@@ -86,6 +109,8 @@ public class S3BackupStoreConfig implements ConfigurationEntry {
     result = 31 * result + (secretKey != null ? secretKey.hashCode() : 0);
     result = 31 * result + (apiCallTimeout != null ? apiCallTimeout.hashCode() : 0);
     result = 31 * result + (forcePathStyleAccess ? 1 : 0);
+    result = 31 * result + (compression != null ? compression.hashCode() : 0);
+    result = 31 * result + (basePath != null ? basePath.hashCode() : 0);
     return result;
   }
 
@@ -103,6 +128,9 @@ public class S3BackupStoreConfig implements ConfigurationEntry {
     if (forcePathStyleAccess != that.forcePathStyleAccess) {
       return false;
     }
+    if (!Objects.equals(compression, that.compression)) {
+      return false;
+    }
     if (!Objects.equals(bucketName, that.bucketName)) {
       return false;
     }
@@ -116,6 +144,9 @@ public class S3BackupStoreConfig implements ConfigurationEntry {
       return false;
     }
     if (!Objects.equals(secretKey, that.secretKey)) {
+      return false;
+    }
+    if (!Objects.equals(basePath, that.basePath)) {
       return false;
     }
     return Objects.equals(apiCallTimeout, that.apiCallTimeout);
@@ -139,9 +170,14 @@ public class S3BackupStoreConfig implements ConfigurationEntry {
         + ", secretKey='"
         + "<redacted>"
         + '\''
-        + ", apiCallTimeout='"
+        + ", apiCallTimeout="
         + apiCallTimeout
-        + '\''
+        + ", forcePathStyleAccess="
+        + forcePathStyleAccess
+        + ", compression="
+        + compression
+        + ", basePath="
+        + basePath
         + '}';
   }
 }

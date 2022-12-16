@@ -11,7 +11,6 @@ import io.camunda.zeebe.broker.Loggers;
 import io.camunda.zeebe.broker.exporter.stream.ExporterDirectorContext.ExporterMode;
 import io.camunda.zeebe.broker.system.partitions.PartitionMessagingService;
 import io.camunda.zeebe.db.ZeebeDb;
-import io.camunda.zeebe.engine.processing.streamprocessor.RecordValues;
 import io.camunda.zeebe.exporter.api.context.Context;
 import io.camunda.zeebe.logstreams.log.LogRecordAwaiter;
 import io.camunda.zeebe.logstreams.log.LogStream;
@@ -29,8 +28,9 @@ import io.camunda.zeebe.scheduler.future.CompletableActorFuture;
 import io.camunda.zeebe.scheduler.retry.BackOffRetryStrategy;
 import io.camunda.zeebe.scheduler.retry.EndlessRetryStrategy;
 import io.camunda.zeebe.scheduler.retry.RetryStrategy;
-import io.camunda.zeebe.streamprocessor.EventFilter;
-import io.camunda.zeebe.streamprocessor.TypedRecordImpl;
+import io.camunda.zeebe.stream.api.EventFilter;
+import io.camunda.zeebe.stream.impl.records.RecordValues;
+import io.camunda.zeebe.stream.impl.records.TypedRecordImpl;
 import io.camunda.zeebe.util.exception.UnrecoverableException;
 import io.camunda.zeebe.util.health.FailureListener;
 import io.camunda.zeebe.util.health.HealthMonitorable;
@@ -361,7 +361,9 @@ public final class ExporterDirector extends Actor implements HealthMonitorable, 
 
   private void distributeExporterPositions() {
     final var exportPositionsMessage = new ExporterPositionsMessage();
-    state.visitPositions(exportPositionsMessage::putExporter);
+    state.visitExporterState(
+        (exporterId, exporterStateEntry) ->
+            exportPositionsMessage.putExporter(exporterId, exporterStateEntry.getPosition()));
     exporterDistributionService.distributeExporterPositions(exportPositionsMessage);
   }
 
@@ -433,10 +435,10 @@ public final class ExporterDirector extends Actor implements HealthMonitorable, 
     final List<String> exporterIds =
         containers.stream().map(ExporterContainer::getId).collect(Collectors.toList());
 
-    state.visitPositions(
-        (exporterId, position) -> {
+    state.visitExporterState(
+        (exporterId, exporterStateEntry) -> {
           if (!exporterIds.contains(exporterId)) {
-            state.removePosition(exporterId);
+            state.removeExporterState(exporterId);
             LOG.info(
                 "The exporter '{}' is not configured anymore. Its lastExportedPosition is removed from the state.",
                 exporterId);

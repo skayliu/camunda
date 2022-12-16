@@ -7,13 +7,13 @@
  */
 package io.camunda.zeebe.engine.processing.common;
 
+import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnStateBehavior;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableCatchEvent;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableFlowElement;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableStartEvent;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.StateWriter;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.TypedCommandWriter;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.Writers;
-import io.camunda.zeebe.engine.state.KeyGenerator;
 import io.camunda.zeebe.engine.state.immutable.EventScopeInstanceState;
 import io.camunda.zeebe.engine.state.immutable.ProcessState;
 import io.camunda.zeebe.engine.state.instance.ElementInstance;
@@ -25,6 +25,7 @@ import io.camunda.zeebe.protocol.record.intent.MessageStartEventSubscriptionInte
 import io.camunda.zeebe.protocol.record.intent.ProcessEventIntent;
 import io.camunda.zeebe.protocol.record.intent.ProcessInstanceIntent;
 import io.camunda.zeebe.protocol.record.value.BpmnElementType;
+import io.camunda.zeebe.stream.api.state.KeyGenerator;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 
@@ -43,26 +44,36 @@ public final class EventHandle {
   private final TypedCommandWriter commandWriter;
   private final StateWriter stateWriter;
   private final EventTriggerBehavior eventTriggerBehavior;
+  private final BpmnStateBehavior stateBehavior;
 
   public EventHandle(
       final KeyGenerator keyGenerator,
       final EventScopeInstanceState eventScopeInstanceState,
       final Writers writers,
       final ProcessState processState,
-      final EventTriggerBehavior eventTriggerBehavior) {
+      final EventTriggerBehavior eventTriggerBehavior,
+      final BpmnStateBehavior stateBehavior) {
     this.keyGenerator = keyGenerator;
     this.eventScopeInstanceState = eventScopeInstanceState;
     this.processState = processState;
     commandWriter = writers.command();
     stateWriter = writers.state();
     this.eventTriggerBehavior = eventTriggerBehavior;
+    this.stateBehavior = stateBehavior;
   }
 
   public boolean canTriggerElement(
       final ElementInstance eventScopeInstance, final DirectBuffer elementId) {
-    return eventScopeInstance != null
-        && eventScopeInstance.isActive()
-        && eventScopeInstanceState.canTriggerEvent(eventScopeInstance.getKey(), elementId);
+    if (eventScopeInstance == null) {
+      return false;
+    }
+
+    final ElementInstance flowScopeInstance =
+        stateBehavior.getElementInstance(eventScopeInstance.getParentKey());
+
+    return eventScopeInstance.isActive()
+        && eventScopeInstanceState.canTriggerEvent(eventScopeInstance.getKey(), elementId)
+        && (flowScopeInstance == null || !flowScopeInstance.isInterrupted());
   }
 
   /**

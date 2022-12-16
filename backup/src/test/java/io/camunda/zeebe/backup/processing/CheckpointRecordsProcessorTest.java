@@ -24,13 +24,13 @@ import io.camunda.zeebe.db.ConsistencyChecksSettings;
 import io.camunda.zeebe.db.ZeebeDb;
 import io.camunda.zeebe.db.impl.rocksdb.RocksDbConfiguration;
 import io.camunda.zeebe.db.impl.rocksdb.ZeebeRocksDbFactory;
-import io.camunda.zeebe.engine.api.ProcessingResultBuilder;
-import io.camunda.zeebe.engine.api.ProcessingScheduleService;
-import io.camunda.zeebe.engine.state.processing.DbKeyGenerator;
 import io.camunda.zeebe.protocol.impl.record.value.management.CheckpointRecord;
 import io.camunda.zeebe.protocol.record.RecordType;
 import io.camunda.zeebe.protocol.record.intent.management.CheckpointIntent;
-import io.camunda.zeebe.streamprocessor.RecordProcessorContextImpl;
+import io.camunda.zeebe.stream.api.ProcessingResultBuilder;
+import io.camunda.zeebe.stream.api.scheduling.ProcessingScheduleService;
+import io.camunda.zeebe.stream.impl.RecordProcessorContextImpl;
+import io.camunda.zeebe.stream.impl.state.DbKeyGenerator;
 import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
@@ -69,7 +69,7 @@ final class CheckpointRecordsProcessorTest {
       final ProcessingScheduleService executor, final ZeebeDb zeebeDb) {
     final var context = zeebeDb.createContext();
     return new RecordProcessorContextImpl(
-        1, executor, zeebeDb, context, null, null, new DbKeyGenerator(1, zeebeDb, context));
+        1, executor, zeebeDb, context, null, new DbKeyGenerator(1, zeebeDb, context));
   }
 
   @AfterEach
@@ -136,6 +136,43 @@ final class CheckpointRecordsProcessorTest {
     final Event followupEvent = result.records().get(0);
     assertThat(followupEvent.intent()).isEqualTo(CheckpointIntent.IGNORED);
     assertThat(followupEvent.type()).isEqualTo(RecordType.EVENT);
+
+    // state not changed
+    assertThat(state.getCheckpointId()).isEqualTo(checkpointId);
+    assertThat(state.getCheckpointPosition()).isEqualTo(checkpointPosition);
+  }
+
+  @Test
+  void shouldNotCreateCheckpointIfHigherCheckpointExists() {
+    // given
+    final long checkpointId = 10;
+    final long checkpointPosition = 10;
+    state.setCheckpointInfo(checkpointId, checkpointPosition);
+
+    final int lowerCheckpointId = 1;
+    final CheckpointRecord value = new CheckpointRecord().setCheckpointId(lowerCheckpointId);
+    final MockTypedCheckpointRecord record =
+        new MockTypedCheckpointRecord(
+            checkpointPosition + 10, 0, CheckpointIntent.CREATE, RecordType.COMMAND, value);
+
+    // when
+    final var result = (MockProcessingResult) processor.process(record, resultBuilder);
+
+    // then
+
+    // backup is not triggered
+    verify(backupManager, never()).takeBackup(lowerCheckpointId, checkpointPosition + 10);
+
+    // followup event is written
+    assertThat(result.records()).hasSize(1);
+    final Event followupEvent = result.records().get(0);
+    assertThat(followupEvent.intent()).isEqualTo(CheckpointIntent.IGNORED);
+    assertThat(followupEvent.type()).isEqualTo(RecordType.EVENT);
+
+    // followup event contains latest checkpoint info
+    final CheckpointRecord followupRecord = (CheckpointRecord) followupEvent.value();
+    assertThat(followupRecord.getCheckpointId()).isEqualTo(checkpointId);
+    assertThat(followupRecord.getCheckpointPosition()).isEqualTo(checkpointPosition);
 
     // state not changed
     assertThat(state.getCheckpointId()).isEqualTo(checkpointId);

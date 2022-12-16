@@ -7,18 +7,15 @@
  */
 package io.camunda.zeebe.logstreams.log;
 
-import static io.camunda.zeebe.test.util.TestUtil.waitUntil;
-import static io.camunda.zeebe.util.buffer.BufferUtil.wrapString;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.junit.Assert.assertNotNull;
 
 import io.camunda.zeebe.logstreams.util.LogStreamRule;
 import io.camunda.zeebe.logstreams.util.SynchronousLogStream;
-import io.camunda.zeebe.test.util.TestUtil;
+import io.camunda.zeebe.logstreams.util.TestEntry;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import org.agrona.DirectBuffer;
+import org.awaitility.Awaitility;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -49,34 +46,7 @@ public final class LogStreamTest {
     assertThat(logStream.getLogName()).isEqualTo("0");
 
     assertThat(logStream.newLogStreamReader()).isNotNull();
-    assertThat(logStream.newLogStreamBatchWriter()).isNotNull();
-    assertThat(logStream.newLogStreamRecordWriter()).isNotNull();
-  }
-
-  @Test
-  public void shouldCreateNewLogStreamRecordWriter() {
-    // given
-    final LogStreamRecordWriter logStreamRecordWriter = logStream.newLogStreamRecordWriter();
-
-    // when
-    final var otherWriter = logStream.newLogStreamRecordWriter();
-
-    // then
-    assertNotNull(logStreamRecordWriter);
-    assertThat(otherWriter).isNotNull().isNotEqualTo(logStreamRecordWriter);
-  }
-
-  @Test
-  public void shouldCreateNewLogStreamBatchWriter() {
-    // given
-    final var logStreamBatchWriter = logStream.newLogStreamBatchWriter();
-
-    // when
-    final var otherWriter = logStream.newLogStreamBatchWriter();
-
-    // then
-    assertNotNull(logStreamBatchWriter);
-    assertThat(otherWriter).isNotNull().isNotEqualTo(logStreamBatchWriter);
+    assertThat(logStream.newLogStreamWriter()).isNotNull();
   }
 
   @Test
@@ -87,25 +57,25 @@ public final class LogStreamTest {
     logStream.close();
 
     // then
-    assertThatThrownBy(() -> logStream.newLogStreamRecordWriter()).hasMessage("Actor is closed");
-    assertThatThrownBy(() -> logStream.newLogStreamBatchWriter()).hasMessage("Actor is closed");
+    assertThatThrownBy(() -> logStream.newLogStreamWriter()).hasMessage("Actor is closed");
   }
 
   @Test
   public void shouldIncreasePositionOnRestart() {
     // given
-    final LogStreamRecordWriter writer = logStream.newLogStreamRecordWriter();
-    writer.value(wrapString("value")).tryWrite();
-    writer.value(wrapString("value")).tryWrite();
-    writer.value(wrapString("value")).tryWrite();
-    final long positionBeforeClose = writer.value(wrapString("value")).tryWrite();
-    TestUtil.waitUntil(() -> logStream.getLastWrittenPosition() >= positionBeforeClose);
+    final var writer = logStream.newSyncLogStreamWriter();
+    writer.tryWrite(TestEntry.ofDefaults());
+    writer.tryWrite(TestEntry.ofDefaults());
+    writer.tryWrite(TestEntry.ofDefaults());
+    final long positionBeforeClose = writer.tryWrite(TestEntry.ofDefaults());
+    Awaitility.await("until everything is written")
+        .until(logStream::getLastWrittenPosition, position -> position >= positionBeforeClose);
 
     // when
     logStream.close();
     logStreamRule.createLogStream();
-    final LogStreamRecordWriter newWriter = logStreamRule.getLogStream().newLogStreamRecordWriter();
-    final long positionAfterReOpen = newWriter.value(wrapString("value")).tryWrite();
+    final var newWriter = logStreamRule.getLogStream().newLogStreamWriter();
+    final long positionAfterReOpen = newWriter.tryWrite(TestEntry.ofDefaults());
 
     // then
     assertThat(positionAfterReOpen).isGreaterThan(positionBeforeClose);
@@ -115,10 +85,10 @@ public final class LogStreamTest {
   public void shouldNotifyWhenNewRecordsAreAvailable() throws InterruptedException {
     // given
     final CountDownLatch latch = new CountDownLatch(1);
-    logStream.getAsyncLogStream().registerRecordAvailableListener(() -> latch.countDown());
+    logStream.getAsyncLogStream().registerRecordAvailableListener(latch::countDown);
 
     // when
-    writeEvent(logStream);
+    logStreamRule.getLogStreamWriter().tryWrite(TestEntry.ofDefaults());
 
     // then
     assertThat(latch.await(2, TimeUnit.SECONDS)).isTrue();
@@ -129,35 +99,16 @@ public final class LogStreamTest {
       throws InterruptedException {
     // given
     final CountDownLatch firstListener = new CountDownLatch(1);
-    logStream.getAsyncLogStream().registerRecordAvailableListener(() -> firstListener.countDown());
+    logStream.getAsyncLogStream().registerRecordAvailableListener(firstListener::countDown);
 
     final CountDownLatch secondListener = new CountDownLatch(1);
-    logStream.getAsyncLogStream().registerRecordAvailableListener(() -> secondListener.countDown());
+    logStream.getAsyncLogStream().registerRecordAvailableListener(secondListener::countDown);
 
     // when
-    writeEvent(logStream);
+    logStreamRule.getLogStreamWriter().tryWrite(TestEntry.ofDefaults());
 
     // then
     assertThat(firstListener.await(2, TimeUnit.SECONDS)).isTrue();
     assertThat(secondListener.await(2, TimeUnit.SECONDS)).isTrue();
-  }
-
-  static long writeEvent(final SynchronousLogStream logStream) {
-    return writeEvent(logStream, wrapString("event"));
-  }
-
-  static long writeEvent(final SynchronousLogStream logStream, final DirectBuffer value) {
-    final LogStreamRecordWriter writer = logStream.newLogStreamRecordWriter();
-
-    long position = -1L;
-
-    while (position < 0) {
-      position = writer.value(value).tryWrite();
-    }
-
-    final long writtenEventPosition = position;
-    waitUntil(() -> logStream.getLastWrittenPosition() >= writtenEventPosition);
-
-    return position;
   }
 }

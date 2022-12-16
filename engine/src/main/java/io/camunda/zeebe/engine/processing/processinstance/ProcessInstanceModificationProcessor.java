@@ -9,8 +9,6 @@ package io.camunda.zeebe.engine.processing.processinstance;
 
 import static java.util.function.Predicate.not;
 
-import io.camunda.zeebe.engine.api.TypedRecord;
-import io.camunda.zeebe.engine.api.records.RecordBatch.ExceededBatchRecordSizeException;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnBehaviors;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnIncidentBehavior;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnJobBehavior;
@@ -19,11 +17,11 @@ import io.camunda.zeebe.engine.processing.common.ElementActivationBehavior;
 import io.camunda.zeebe.engine.processing.common.ElementActivationBehavior.ActivatedElementKeys;
 import io.camunda.zeebe.engine.processing.common.EventSubscriptionException;
 import io.camunda.zeebe.engine.processing.common.MultipleFlowScopeInstancesFoundException;
+import io.camunda.zeebe.engine.processing.common.UnsupportedMultiInstanceBodyActivationException;
 import io.camunda.zeebe.engine.processing.deployment.model.element.AbstractFlowElement;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableCatchEventElement;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableFlowElement;
 import io.camunda.zeebe.engine.processing.streamprocessor.TypedRecordProcessor;
-import io.camunda.zeebe.engine.processing.streamprocessor.sideeffect.SideEffectProducer;
 import io.camunda.zeebe.engine.processing.streamprocessor.sideeffect.SideEffectQueue;
 import io.camunda.zeebe.engine.processing.streamprocessor.sideeffect.SideEffects;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.StateWriter;
@@ -45,15 +43,19 @@ import io.camunda.zeebe.protocol.record.value.BpmnElementType;
 import io.camunda.zeebe.protocol.record.value.ProcessInstanceModificationRecordValue.ProcessInstanceModificationActivateInstructionValue;
 import io.camunda.zeebe.protocol.record.value.ProcessInstanceModificationRecordValue.ProcessInstanceModificationTerminateInstructionValue;
 import io.camunda.zeebe.protocol.record.value.ProcessInstanceModificationRecordValue.ProcessInstanceModificationVariableInstructionValue;
+import io.camunda.zeebe.stream.api.SideEffectProducer;
+import io.camunda.zeebe.stream.api.records.ExceededBatchRecordSizeException;
+import io.camunda.zeebe.stream.api.records.TypedRecord;
 import io.camunda.zeebe.util.Either;
 import io.camunda.zeebe.util.buffer.BufferUtil;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-import org.agrona.DirectBuffer;
 import org.agrona.Strings;
 
 public final class ProcessInstanceModificationProcessor
@@ -62,7 +64,8 @@ public final class ProcessInstanceModificationProcessor
   private static final String ERROR_MESSAGE_PROCESS_INSTANCE_NOT_FOUND =
       "Expected to modify process instance but no process instance found with key '%d'";
   private static final String ERROR_MESSAGE_ACTIVATE_ELEMENT_NOT_FOUND =
-      "Expected to modify instance of process '%s' but it contains one or more activate instructions with an element that could not be found: '%s'";
+      "Expected to modify instance of process '%s' but it contains one or more activate instructions"
+          + " with an element that could not be found: '%s'";
   private static final String ERROR_MESSAGE_ACTIVATE_ELEMENT_UNSUPPORTED =
       "Expected to modify instance of process '%s' but it contains one or more activate instructions"
           + " for elements that are unsupported: '%s'. %s.";
@@ -95,6 +98,23 @@ public final class ProcessInstanceModificationProcessor
       Expected to modify instance of process '%s' but the given instructions would terminate \
       the instance. The instance was created by a call activity in the parent process. \
       To terminate this instance please modify the parent process instead.""";
+
+  private static final String ERROR_MESSAGE_ANCESTOR_NOT_FOUND =
+      """
+      Expected to modify instance of process '%s' but it contains one or more activate instructions \
+      with an ancestor scope key that does not exist, or is not in an active state: '%s'""";
+
+  private static final String ERROR_MESSAGE_ATTEMPTED_TO_ACTIVATE_MULTI_INSTANCE =
+      """
+      Expected to modify instance of process '%s' but it contains one or more activate instructions \
+      that would result in the activation of multi-instance element '%s', which is currently \
+      unsupported.""";
+
+  private static final String ERROR_MESSAGE_ANCESTOR_WRONG_PROCESS_INSTANCE =
+      """
+      Expected to modify instance of process '%s' but it contains one or more activate \
+      instructions with an ancestor scope key that does not belong to the modified process \
+      instance: '%s'""";
 
   private static final Set<BpmnElementType> UNSUPPORTED_ELEMENT_TYPES =
       Set.of(
@@ -177,11 +197,13 @@ public final class ProcessInstanceModificationProcessor
                 instruction -> {
                   final var elementToActivate =
                       process.getProcess().getElementById(instruction.getElementId());
+                  final var ancestorScopeKey = instruction.getAncestorScopeKey();
 
                   final ActivatedElementKeys activatedElementKeys =
                       elementActivationBehavior.activateElement(
                           processInstanceRecord,
                           elementToActivate,
+                          ancestorScopeKey,
                           (elementId, scopeKey) ->
                               executeVariableInstruction(
                                   BufferUtil.bufferAsString(elementId),
@@ -248,14 +270,10 @@ public final class ProcessInstanceModificationProcessor
       return ProcessingError.EXPECTED_ERROR;
 
     } else if (error instanceof ExceededBatchRecordSizeException) {
-      rejectionWriter.appendRejection(
-          typedCommand,
-          RejectionType.INVALID_ARGUMENT,
-          ERROR_COMMAND_TOO_LARGE.formatted(typedCommand.getValue().getProcessInstanceKey()));
-      responseWriter.writeRejectionOnCommand(
-          typedCommand,
-          RejectionType.INVALID_ARGUMENT,
-          ERROR_COMMAND_TOO_LARGE.formatted(typedCommand.getValue().getProcessInstanceKey()));
+      final var message =
+          ERROR_COMMAND_TOO_LARGE.formatted(typedCommand.getValue().getProcessInstanceKey());
+      rejectionWriter.appendRejection(typedCommand, RejectionType.INVALID_ARGUMENT, message);
+      responseWriter.writeRejectionOnCommand(typedCommand, RejectionType.INVALID_ARGUMENT, message);
       return ProcessingError.EXPECTED_ERROR;
 
     } else if (error instanceof TerminatedChildProcessException exception) {
@@ -264,7 +282,16 @@ public final class ProcessInstanceModificationProcessor
       responseWriter.writeRejectionOnCommand(
           typedCommand, RejectionType.INVALID_ARGUMENT, exception.getMessage());
       return ProcessingError.EXPECTED_ERROR;
+
+    } else if (error instanceof UnsupportedMultiInstanceBodyActivationException exception) {
+      final var message =
+          ERROR_MESSAGE_ATTEMPTED_TO_ACTIVATE_MULTI_INSTANCE.formatted(
+              exception.getBpmnProcessId(), exception.getMultiInstanceId());
+      rejectionWriter.appendRejection(typedCommand, RejectionType.INVALID_ARGUMENT, message);
+      responseWriter.writeRejectionOnCommand(typedCommand, RejectionType.INVALID_ARGUMENT, message);
+      return ProcessingError.EXPECTED_ERROR;
     }
+
     return ProcessingError.UNEXPECTED_ERROR;
   }
 
@@ -279,6 +306,7 @@ public final class ProcessInstanceModificationProcessor
         .flatMap(valid -> validateElementInstanceExists(process, terminateInstructions))
         .flatMap(valid -> validateVariableScopeExists(process, activateInstructions))
         .flatMap(valid -> validateVariableScopeIsFlowScope(process, activateInstructions))
+        .flatMap(valid -> validateAncestorKeys(process, value))
         .map(valid -> VALID);
   }
 
@@ -307,7 +335,6 @@ public final class ProcessInstanceModificationProcessor
       final DeployedProcess process,
       final List<ProcessInstanceModificationActivateInstructionValue> activateInstructions) {
     return validateElementsDoNotBelongToEventBasedGateway(process, activateInstructions)
-        .flatMap(valid -> validateElementsNotInsideMultiInstance(process, activateInstructions))
         .flatMap(valid -> validateElementsHaveSupportedType(process, activateInstructions))
         .map(valid -> VALID);
   }
@@ -336,30 +363,6 @@ public final class ProcessInstanceModificationProcessor
             BufferUtil.bufferAsString(process.getBpmnProcessId()),
             String.join("', '", elementIdsConnectedToEventBasedGateway),
             "The activation of events belonging to an event-based gateway is not supported");
-    return Either.left(new Rejection(RejectionType.INVALID_ARGUMENT, reason));
-  }
-
-  private Either<Rejection, ?> validateElementsNotInsideMultiInstance(
-      final DeployedProcess process,
-      final List<ProcessInstanceModificationActivateInstructionValue> activateInstructions) {
-    final List<String> elementsInsideMultiInstance =
-        activateInstructions.stream()
-            .map(ProcessInstanceModificationActivateInstructionValue::getElementId)
-            .distinct()
-            .filter(
-                elementId -> isInsideMultiInstanceBody(process, BufferUtil.wrapString(elementId)))
-            .toList();
-
-    if (elementsInsideMultiInstance.isEmpty()) {
-      return VALID;
-    }
-
-    final String reason =
-        String.format(
-            ERROR_MESSAGE_ACTIVATE_ELEMENT_UNSUPPORTED,
-            BufferUtil.bufferAsString(process.getBpmnProcessId()),
-            String.join("', '", elementsInsideMultiInstance),
-            "The activation of elements inside a multi-instance subprocess is not supported");
     return Either.left(new Rejection(RejectionType.INVALID_ARGUMENT, reason));
   }
 
@@ -399,20 +402,79 @@ public final class ProcessInstanceModificationProcessor
     return Either.left(new Rejection(RejectionType.INVALID_ARGUMENT, reason));
   }
 
-  private boolean isInsideMultiInstanceBody(
-      final DeployedProcess process, final DirectBuffer elementId) {
-    final var element = process.getProcess().getElementById(elementId);
+  private Either<Rejection, ?> validateAncestorKeys(
+      final DeployedProcess process, final ProcessInstanceModificationRecord record) {
+    final Map<Long, Optional<ElementInstance>> ancestorInstances =
+        record.getActivateInstructions().stream()
+            .map(ProcessInstanceModificationActivateInstructionValue::getAncestorScopeKey)
+            .filter(ancestorKey -> ancestorKey > 0)
+            .distinct()
+            .collect(
+                Collectors.toMap(
+                    ancestorKey -> ancestorKey,
+                    ancestorKey ->
+                        Optional.ofNullable(elementInstanceState.getInstance(ancestorKey))));
 
-    if (element.getFlowScope() == null) {
-      return false;
+    return validateAncestorExistsAndIsActive(process, record, ancestorInstances)
+        .flatMap(
+            valid -> validateAncestorBelongsToProcessInstance(process, record, ancestorInstances))
+        .map(valid -> VALID);
+  }
+
+  private Either<Rejection, ?> validateAncestorExistsAndIsActive(
+      final DeployedProcess process,
+      final ProcessInstanceModificationRecord record,
+      final Map<Long, Optional<ElementInstance>> ancestorInstances) {
+    final Set<String> invalidAncestorKeys =
+        record.getActivateInstructions().stream()
+            .map(ProcessInstanceModificationActivateInstructionValue::getAncestorScopeKey)
+            .distinct()
+            .filter(ancestorKey -> ancestorKey > 0)
+            .filter(
+                ancestorKey -> {
+                  final var elementInstanceOptional = ancestorInstances.get(ancestorKey);
+                  return elementInstanceOptional.isEmpty()
+                      || !elementInstanceOptional.get().isActive();
+                })
+            .map(String::valueOf)
+            .collect(Collectors.toSet());
+
+    if (invalidAncestorKeys.isEmpty()) {
+      return VALID;
     }
 
-    // We can't use element.getFlowScope() here as it return the element instead of the
-    // multi-instance body (e.g. the subprocess)
-    final var flowScope = process.getProcess().getElementById(element.getFlowScope().getId());
+    final String reason =
+        String.format(
+            ERROR_MESSAGE_ANCESTOR_NOT_FOUND,
+            BufferUtil.bufferAsString(process.getBpmnProcessId()),
+            String.join("', '", invalidAncestorKeys));
+    return Either.left(new Rejection(RejectionType.INVALID_ARGUMENT, reason));
+  }
 
-    return flowScope.getElementType() == BpmnElementType.MULTI_INSTANCE_BODY
-        || isInsideMultiInstanceBody(process, flowScope.getId());
+  private Either<Rejection, ?> validateAncestorBelongsToProcessInstance(
+      final DeployedProcess process,
+      final ProcessInstanceModificationRecord record,
+      final Map<Long, Optional<ElementInstance>> ancestorInstances) {
+    final Set<String> rejectedAncestorKeys =
+        ancestorInstances.values().stream()
+            .flatMap(Optional::stream)
+            .filter(
+                ancestorInstance ->
+                    ancestorInstance.getValue().getProcessInstanceKey()
+                        != record.getProcessInstanceKey())
+            .map(ancestorInstance -> String.valueOf(ancestorInstance.getKey()))
+            .collect(Collectors.toSet());
+
+    if (rejectedAncestorKeys.isEmpty()) {
+      return VALID;
+    }
+
+    final String reason =
+        String.format(
+            ERROR_MESSAGE_ANCESTOR_WRONG_PROCESS_INSTANCE,
+            BufferUtil.bufferAsString(process.getBpmnProcessId()),
+            String.join("', '", rejectedAncestorKeys));
+    return Either.left(new Rejection(RejectionType.INVALID_ARGUMENT, reason));
   }
 
   private Either<Rejection, ?> validateElementInstanceExists(
@@ -572,7 +634,9 @@ public final class ProcessInstanceModificationProcessor
     } else if (elementType == BpmnElementType.CALL_ACTIVITY) {
       final var calledActivityElementInstance =
           elementInstanceState.getInstance(elementInstance.getCalledChildInstanceKey());
-      terminateElement(calledActivityElementInstance, sideEffects);
+      if (calledActivityElementInstance != null && calledActivityElementInstance.canTerminate()) {
+        terminateElement(calledActivityElementInstance, sideEffects);
+      }
     }
 
     stateWriter.appendFollowUpEvent(

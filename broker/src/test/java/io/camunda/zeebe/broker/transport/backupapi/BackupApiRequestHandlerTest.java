@@ -8,6 +8,8 @@
 package io.camunda.zeebe.broker.transport.backupapi;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -18,7 +20,9 @@ import io.camunda.zeebe.backup.api.BackupStatus;
 import io.camunda.zeebe.backup.common.BackupDescriptorImpl;
 import io.camunda.zeebe.backup.common.BackupIdentifierImpl;
 import io.camunda.zeebe.backup.common.BackupStatusImpl;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
+import io.camunda.zeebe.logstreams.log.LogAppendEntry;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
+import io.camunda.zeebe.protocol.impl.encoding.BackupListResponse;
 import io.camunda.zeebe.protocol.impl.encoding.BackupRequest;
 import io.camunda.zeebe.protocol.impl.encoding.BackupStatusResponse;
 import io.camunda.zeebe.protocol.impl.encoding.ErrorResponse;
@@ -29,10 +33,14 @@ import io.camunda.zeebe.protocol.record.ErrorCode;
 import io.camunda.zeebe.scheduler.future.CompletableActorFuture;
 import io.camunda.zeebe.scheduler.testing.ControlledActorSchedulerExtension;
 import io.camunda.zeebe.transport.ServerOutput;
+import io.camunda.zeebe.transport.ServerResponse;
 import io.camunda.zeebe.transport.impl.AtomixServerTransport;
 import io.camunda.zeebe.util.Either;
+import io.camunda.zeebe.util.buffer.BufferReader;
+import io.camunda.zeebe.util.buffer.BufferUtil;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import org.agrona.ExpandableArrayBuffer;
@@ -54,21 +62,21 @@ final class BackupApiRequestHandlerTest {
   @Mock AtomixServerTransport transport;
 
   @Mock(answer = Answers.RETURNS_SELF)
-  LogStreamRecordWriter logStreamRecordWriter;
+  LogStreamWriter logStreamWriter;
 
   @Mock BackupManager backupManager;
 
   BackupApiRequestHandler handler;
-  private ServerOutput serverOutput;
-  private CompletableFuture<Either<ErrorResponse, BackupStatusResponse>> responseFuture;
+  private ResponseReader serverOutput;
+  private CompletableFuture<Either<ErrorResponse, BufferReader>> responseFuture;
 
   @BeforeEach
   void setup() {
-    handler = new BackupApiRequestHandler(transport, logStreamRecordWriter, backupManager, 1, true);
+    handler = new BackupApiRequestHandler(transport, logStreamWriter, backupManager, 1, true);
     scheduler.submitActor(handler);
     scheduler.workUntilDone();
 
-    serverOutput = createServerOutput();
+    serverOutput = new ResponseReader();
     responseFuture = new CompletableFuture<>();
   }
 
@@ -104,7 +112,7 @@ final class BackupApiRequestHandlerTest {
     handleRequest(request);
 
     // then
-    verify(logStreamRecordWriter, times(1)).tryWrite();
+    verify(logStreamWriter, times(1)).tryWrite(any(LogAppendEntry.class));
   }
 
   @Test
@@ -129,7 +137,7 @@ final class BackupApiRequestHandlerTest {
         .extracting(Either::getLeft)
         .extracting(ErrorResponse::getErrorCode)
         .isEqualTo(ErrorCode.RESOURCE_EXHAUSTED);
-    verify(logStreamRecordWriter, never()).tryWrite();
+    verify(logStreamWriter, never()).tryWrite(any(LogAppendEntry.class));
   }
 
   @Test
@@ -178,13 +186,13 @@ final class BackupApiRequestHandlerTest {
         .thenReturn(CompletableActorFuture.completed(status));
 
     // when
+    final BackupStatusResponse statusResponse = new BackupStatusResponse();
+    serverOutput.setResponseObject(statusResponse);
     handleRequest(request);
 
     // then
-    assertThat(responseFuture)
-        .succeedsWithin(Duration.ofMillis(100))
-        .matches(Either::isRight)
-        .extracting(Either::get)
+    assertThat(responseFuture).succeedsWithin(Duration.ofMillis(100)).matches(Either::isRight);
+    assertThat(statusResponse)
         .returns(checkpointId, BackupStatusResponse::getBackupId)
         .returns(1, BackupStatusResponse::getPartitionId)
         .returns(1, BackupStatusResponse::getBrokerId)
@@ -221,13 +229,13 @@ final class BackupApiRequestHandlerTest {
         .thenReturn(CompletableActorFuture.completed(status));
 
     // when
+    final BackupStatusResponse statusResponse = new BackupStatusResponse();
+    serverOutput.setResponseObject(statusResponse);
     handleRequest(request);
 
     // then
-    assertThat(responseFuture)
-        .succeedsWithin(Duration.ofMillis(100))
-        .matches(Either::isRight)
-        .extracting(Either::get)
+    assertThat(responseFuture).succeedsWithin(Duration.ofMillis(100)).matches(Either::isRight);
+    assertThat(statusResponse)
         .returns(checkpointId, BackupStatusResponse::getBackupId)
         .returns(1, BackupStatusResponse::getPartitionId)
         .returns(1, BackupStatusResponse::getBrokerId)
@@ -237,7 +245,7 @@ final class BackupApiRequestHandlerTest {
         .returns(
             BackupStatusResponseEncoder.numberOfPartitionsNullValue(),
             BackupStatusResponse::getNumberOfPartitions)
-        .matches(response -> response.getSnapshotId().isEmpty())
+        .returns(null, BackupStatusResponse::getSnapshotId)
         .returns(BackupStatusCode.FAILED, BackupStatusResponse::getStatus)
         .returns("Expected", BackupStatusResponse::getFailureReason);
   }
@@ -268,6 +276,97 @@ final class BackupApiRequestHandlerTest {
         .isEqualTo(ErrorCode.INTERNAL_ERROR);
   }
 
+  @Test
+  void shouldCompleteResponseWithBackupList() {
+    // given
+    final var request = new BackupRequest().setType(BackupRequestType.LIST).setPartitionId(1);
+
+    final Instant createdAt = Instant.ofEpochMilli(1000);
+    final Instant lastModified = Instant.ofEpochMilli(2000);
+    final BackupStatus status =
+        new BackupStatusImpl(
+            new BackupIdentifierImpl(1, 1, 2),
+            Optional.of(new BackupDescriptorImpl(Optional.of("s-id"), 100, 3, "test")),
+            io.camunda.zeebe.backup.api.BackupStatusCode.COMPLETED,
+            Optional.empty(),
+            Optional.of(createdAt),
+            Optional.of(lastModified));
+
+    when(backupManager.listBackups()).thenReturn(CompletableActorFuture.completed(List.of(status)));
+
+    // when
+    final BackupListResponse listResponse = new BackupListResponse(List.of());
+    serverOutput.setResponseObject(listResponse);
+    handleRequest(request);
+
+    // then
+    assertThat(responseFuture).succeedsWithin(Duration.ofMillis(100)).matches(Either::isRight);
+    final var expected =
+        new BackupListResponse.BackupStatus(
+            2, 1, BackupStatusCode.COMPLETED, "", "test", createdAt.toString());
+    assertThat(listResponse.getBackups()).containsExactly(expected);
+  }
+
+  @Test
+  void shouldSendErrorResponseWhenListFailed() {
+    // given
+    final var request = new BackupRequest().setType(BackupRequestType.LIST).setPartitionId(1);
+
+    when(backupManager.listBackups())
+        .thenReturn(
+            CompletableActorFuture.completedExceptionally(new RuntimeException("list failed")));
+
+    // when
+    handleRequest(request);
+
+    // then
+    assertThat(responseFuture)
+        .succeedsWithin(Duration.ofMillis(100))
+        .matches(Either::isLeft)
+        .extracting(Either::getLeft)
+        .returns(ErrorCode.INTERNAL_ERROR, ErrorResponse::getErrorCode)
+        .returns("list failed", error -> BufferUtil.bufferAsString(error.getErrorData()));
+  }
+
+  @Test
+  void shouldDeleteBackup() {
+    // given
+    final var request = new BackupRequest().setType(BackupRequestType.DELETE).setPartitionId(1);
+
+    when(backupManager.deleteBackup(anyLong())).thenReturn(CompletableActorFuture.completed(null));
+
+    // when
+    final BackupStatusResponse statusResponse = new BackupStatusResponse();
+    serverOutput.setResponseObject(statusResponse);
+    handleRequest(request);
+
+    // then
+    assertThat(responseFuture).succeedsWithin(Duration.ofMillis(100)).matches(Either::isRight);
+    assertThat(statusResponse.getStatus()).isEqualTo(BackupStatusCode.DOES_NOT_EXIST);
+  }
+
+  @Test
+  void shouldReturnErrorWhenDeleteFails() {
+    // given
+    final var request = new BackupRequest().setType(BackupRequestType.DELETE).setPartitionId(1);
+
+    when(backupManager.deleteBackup(anyLong()))
+        .thenReturn(
+            CompletableActorFuture.completedExceptionally(
+                new RuntimeException("Expected failure")));
+
+    // when
+    handleRequest(request);
+
+    // then
+    assertThat(responseFuture)
+        .succeedsWithin(Duration.ofMillis(100))
+        .matches(Either::isLeft)
+        .extracting(Either::getLeft)
+        .returns(ErrorCode.INTERNAL_ERROR, ErrorResponse::getErrorCode)
+        .returns("Expected failure", error -> BufferUtil.bufferAsString(error.getErrorData()));
+  }
+
   private void handleRequest(final BackupRequest request) {
     final var requestBuffer = new UnsafeBuffer(new byte[request.getLength()]);
     request.write(requestBuffer, 0);
@@ -276,8 +375,16 @@ final class BackupApiRequestHandlerTest {
     scheduler.workUntilDone();
   }
 
-  private ServerOutput createServerOutput() {
-    return serverResponse -> {
+  final class ResponseReader implements ServerOutput {
+
+    BufferReader responseWrapper;
+
+    void setResponseObject(final BufferReader responseObject) {
+      responseWrapper = responseObject;
+    }
+
+    @Override
+    public void sendResponse(final ServerResponse serverResponse) {
       final var buffer = new ExpandableArrayBuffer();
       serverResponse.write(buffer, 0);
 
@@ -288,13 +395,12 @@ final class BackupApiRequestHandlerTest {
         return;
       }
 
-      final var response = new BackupStatusResponse();
       try {
-        response.wrap(buffer, 0, serverResponse.getLength());
-        responseFuture.complete(Either.right(response));
+        responseWrapper.wrap(buffer, 0, serverResponse.getLength());
+        responseFuture.complete(Either.right(responseWrapper));
       } catch (final Exception e) {
         responseFuture.completeExceptionally(e);
       }
-    };
+    }
   }
 }

@@ -18,10 +18,13 @@ defaults:
     # see https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#exit-codes-and-error-action-preference
     shell: bash
 
+env:
+  BUILD_DOCKER_PLATFORMS: "linux/amd64,linux/arm64"
+
 jobs:
   integration-tests:
     name: Integration tests
-    runs-on: [ self-hosted, linux, "16" ]
+    runs-on: [ self-hosted, linux, amd64, "16" ]
     timeout-minutes: 45
     env:
       TC_CLOUD_LOGS_VERBOSE: true
@@ -79,7 +82,7 @@ jobs:
           name: Integration Tests
   qa-update-tests:
     name: QA Update tests
-    runs-on: [ self-hosted, linux, "16" ]
+    runs-on: [ self-hosted, linux, amd64, "16" ]
     timeout-minutes: 45
     env:
       TC_CLOUD_LOGS_VERBOSE: true
@@ -136,7 +139,7 @@ jobs:
           name: QA Update Tests
   unit-tests:
     name: Unit tests
-    runs-on: [ self-hosted, linux, "16" ]
+    runs-on: [ self-hosted, linux, amd64, "16" ]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
@@ -172,13 +175,24 @@ jobs:
         with:
           name: "unit tests"
   smoke-tests:
-    name: Smoke tests on ${{ matrix.os }}
+    name: Smoke tests on ${{ matrix.os }} with ${{ matrix.arch }}
     timeout-minutes: 20
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ macos-latest, windows-latest, ubuntu-latest ]
+        os: [ macos, windows, linux ]
+        arch: [ amd64 ]
+        include:
+          - os: macos
+            runner: macos-latest
+          - os: windows
+            runner: windows-latest
+          - os: linux
+            runner: n1-standard-8-netssd-preempt
+          - os: linux
+            runner: [ self-hosted, linux, arm64, "4" ]
+            arch: arm64
     env:
       JAVA_TOOL_OPTIONS: -XX:+TieredCompilation -XX:TieredStopAtLevel=1 -XX:ReservedCodeCacheSize=64M
     steps:
@@ -187,26 +201,40 @@ jobs:
         with:
           go: false
           # setting up maven often times out on macOS
-          maven: ${{ matrix.os != 'macos-latest' }}
+          maven: ${{ runner.os != 'macOS' }}
       - uses: ./.github/actions/build-zeebe
+        id: build-zeebe
         with:
           go: false
-          maven-extra-args: -am -pl qa/integration-tests -T1C
-      - name: Run smoke test
+          maven-extra-args: -T1C
+      - uses: ./.github/actions/build-docker
+        id: build-docker
+        # Currently only Linux runners support building docker images without further ado
+        if: ${{ runner.os == 'Linux' }}
+        with:
+          version: current-test
+          distball: ${{ steps.build-zeebe.outputs.distball }}
+          platforms: linux/${{ matrix.arch }}
+          push: false
+      - name: Run smoke test on ${{ matrix.arch }}
+        env:
+          # For non Linux runners there is no container available for testing, see build-docker job
+          EXCLUDED_TEST_GROUPS: ${{ runner.os != 'Linux' && 'container' }}
         run: >
           mvn -B --no-snapshot-updates
           -DskipUTs -DskipChecks -Dsurefire.rerunFailingTestsCount=3
           -pl qa/integration-tests
           -P smoke-test,extract-flaky-tests
+          -D excludedGroups=$EXCLUDED_TEST_GROUPS
           verify
       - name: Upload test artifacts
         uses: ./.github/actions/collect-test-artifacts
         if: always()
         with:
-          name: Smoke Tests ${{ matrix.os }}
+          name: Smoke Tests on ${{ matrix.os }} with ${{ matrix.arch }}
   property-tests:
     name: Property Tests
-    runs-on: [ self-hosted, linux, "16" ]
+    runs-on: [ self-hosted, linux, amd64, "16" ]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v3
@@ -285,11 +313,10 @@ jobs:
       # This is a workaround for java 8, which does not support the --add-exports options
       - run: rm .mvn/jvm.config
       # Then run client tests with JDK 8
-      - uses: actions/setup-java@v3.6.0
+      - uses: actions/setup-java@v3.9.0
         with:
           java-version: '8'
           distribution: 'temurin'
-          cache: maven
       - name: Create build output log file
         run: echo "BUILD_OUTPUT_FILE_PATH=$(mktemp)" >> $GITHUB_ENV
       - name: Maven Test Build
@@ -312,7 +339,7 @@ jobs:
           name: Java 8 Client
   codeql:
     name: CodeQL
-    runs-on: [ self-hosted, linux, "16" ]
+    runs-on: [ self-hosted, linux, amd64, "16" ]
     permissions:
       security-events: write
     steps:
@@ -375,15 +402,22 @@ jobs:
   docker-checks:
     name: Docker checks
     runs-on: ubuntu-latest
+    services:
+      # local registry is used as this job needs to push as it builds multi-platform images
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
     steps:
       - uses: actions/checkout@v3
-      - uses: hadolint/hadolint-action@v2.1.0
+      - uses: hadolint/hadolint-action@v3.0.0
         with:
           config: ./.hadolint.yaml
           dockerfile: ./Dockerfile
           format: sarif
           output-file: ./hadolint.sarif
           no-color: true
+          verbose: true
       - name: Upload Hadolint Results
         uses: github/codeql-action/upload-sarif@v2
         with:
@@ -394,15 +428,22 @@ jobs:
       - uses: ./.github/actions/build-docker
         id: build-docker
         with:
-          # give it a fake name to ensure we never try pushing it
+          # we use a local registry for pushing
           repository: localhost:5000/camunda/zeebe
           distball: ${{ steps.build-zeebe.outputs.distball }}
-      - name: Verify Docker image
+          platforms: ${{ env.BUILD_DOCKER_PLATFORMS }}
+          # push is needed for multi-arch images as buildkit does not support loading them locally
+          push: true
+      - name: Verify Docker images
         env:
           DATE: ${{ steps.build-docker.outputs.date }}
           REVISION: ${{ github.sha }}
           VERSION: ${{ steps.build-docker.outputs.version }}
-        run: ${PWD}/docker/test/verify.sh '${{ steps.build-docker.outputs.image }}'
+        run: |
+          docker pull --platform linux/amd64 ${{ steps.build-docker.outputs.image }}
+          ${PWD}/docker/test/verify.sh '${{ steps.build-docker.outputs.image }}' amd64
+          docker pull --platform linux/arm64 ${{ steps.build-docker.outputs.image }}
+          ${PWD}/docker/test/verify.sh '${{ steps.build-docker.outputs.image }}' arm64
   test-summary:
     # Used by bors to check all tests, including the unit test matrix.
     # New test jobs must be added to the `needs` lists!
@@ -457,7 +498,7 @@ jobs:
       - uses: actions/checkout@v3
       - name: Import Secrets
         id: secrets
-        uses: hashicorp/vault-action@v2.4.2
+        uses: hashicorp/vault-action@v2.4.3
         with:
           url: ${{ secrets.VAULT_ADDR }}
           method: approle
@@ -466,7 +507,7 @@ jobs:
           secrets: |
             secret/data/products/zeebe/ci/zeebe ARTIFACTS_USR;
             secret/data/products/zeebe/ci/zeebe ARTIFACTS_PSW;
-      - uses: actions/setup-java@v3.6.0
+      - uses: actions/setup-java@v3.9.0
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -492,7 +533,7 @@ jobs:
       - uses: actions/checkout@v3
       - name: Import Secrets
         id: secrets
-        uses: hashicorp/vault-action@v2.4.2
+        uses: hashicorp/vault-action@v2.4.3
         with:
           url: ${{ secrets.VAULT_ADDR }}
           method: approle
@@ -514,6 +555,7 @@ jobs:
         with:
           repository: camunda/zeebe
           version: SNAPSHOT
+          platforms: ${{ env.BUILD_DOCKER_PLATFORMS }}
           push: true
           distball: ${{ steps.build-zeebe.outputs.distball }}
   notify-if-failed:

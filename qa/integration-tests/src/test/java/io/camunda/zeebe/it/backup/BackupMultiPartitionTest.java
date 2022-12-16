@@ -7,9 +7,11 @@
  */
 package io.camunda.zeebe.it.backup;
 
+import static java.util.function.Predicate.isEqual;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.camunda.zeebe.backup.s3.S3BackupConfig;
+import io.camunda.zeebe.backup.s3.S3BackupConfig.Builder;
 import io.camunda.zeebe.backup.s3.S3BackupStore;
 import io.camunda.zeebe.broker.system.configuration.BrokerCfg;
 import io.camunda.zeebe.broker.system.configuration.backup.BackupStoreCfg.BackupStoreType;
@@ -18,6 +20,7 @@ import io.camunda.zeebe.gateway.admin.backup.BackupRequestHandler;
 import io.camunda.zeebe.gateway.admin.backup.BackupStatus;
 import io.camunda.zeebe.gateway.admin.backup.BackupStatusRequest;
 import io.camunda.zeebe.gateway.admin.backup.BrokerBackupRequest;
+import io.camunda.zeebe.gateway.admin.backup.State;
 import io.camunda.zeebe.gateway.impl.broker.BrokerClient;
 import io.camunda.zeebe.it.clustering.ClusteringRuleExtension;
 import io.camunda.zeebe.it.util.GrpcClientRule;
@@ -107,14 +110,14 @@ class BackupMultiPartitionTest {
   void createBackupStoreForTest() {
     // Create bucket before for storing backups
     s3ClientConfig =
-        S3BackupConfig.from(
-            bucketName,
-            S3.externalEndpoint(),
-            S3.region(),
-            S3.accessKey(),
-            S3.secretKey(),
-            Duration.ofSeconds(15),
-            true);
+        new Builder()
+            .withBucketName(bucketName)
+            .withEndpoint(S3.externalEndpoint())
+            .withRegion(S3.region())
+            .withCredentials(S3.accessKey(), S3.secretKey())
+            .withApiCallTimeout(Duration.ofSeconds(15))
+            .forcePathStyleAccess(true)
+            .build();
     s3BackupStore = new S3BackupStore(s3ClientConfig);
     try (final var s3Client = S3BackupStore.buildClient(s3ClientConfig)) {
       s3Client.createBucket(builder -> builder.bucket(bucketName).build()).join();
@@ -225,6 +228,24 @@ class BackupMultiPartitionTest {
     }
   }
 
+  @Test
+  @Timeout(value = 180)
+  void shouldDeleteBackup() {
+    // given
+    final var backupId = 4;
+    backup(backupId);
+    waitUntilBackupIsCompleted(backupId);
+
+    // when
+    delete(backupId);
+
+    // then
+    Awaitility.await("Backup must be deleted.")
+        .timeout(Duration.ofSeconds(30))
+        .ignoreExceptions()
+        .until(() -> getBackupStatus(backupId).status(), isEqual(State.DOES_NOT_EXIST));
+  }
+
   private Set<Long> createJobsOnAllPartitions() {
     final Set<Integer> partitions = new HashSet<>();
     final Set<Long> jobKeys = new HashSet<>();
@@ -259,6 +280,11 @@ class BackupMultiPartitionTest {
         .succeedsWithin(Duration.ofSeconds(30));
   }
 
+  private void delete(final long backupId) {
+    assertThat(backupRequestHandler.deleteBackup(backupId).toCompletableFuture())
+        .succeedsWithin(Duration.ofSeconds(30));
+  }
+
   private void restoreBroker(final long backupId, final int brokerId) {
     try {
       new RestoreManager(clusteringRule.getBrokerCfg(brokerId), s3BackupStore)
@@ -276,7 +302,7 @@ class BackupMultiPartitionTest {
         .untilAsserted(
             () -> {
               final var status = getBackupStatus(backupId);
-              assertThat(status.status()).isEqualTo(BackupStatusCode.COMPLETED);
+              assertThat(status.status()).isEqualTo(State.COMPLETED);
               assertThat(status.backupId()).isEqualTo(backupId);
               assertThat(status.partitions()).hasSize(clusteringRule.getPartitionCount());
             });

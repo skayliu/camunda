@@ -58,19 +58,7 @@ public class LogStreamErrorTest {
   @Test
   public void shouldCompleteFutureWhenCreateWriterFailed() {
     // given
-    final var writerFuture = logStream.getAsyncLogStream().newLogStreamRecordWriter();
-
-    // when
-    Awaitility.await().until(writerFuture::isDone);
-
-    // then
-    assertThat(writerFuture.isCompletedExceptionally()).isTrue();
-  }
-
-  @Test
-  public void shouldCompleteFutureWhenCreateBatchWriterFailed() {
-    // given
-    final var writerFuture = logStream.getAsyncLogStream().newLogStreamBatchWriter();
+    final var writerFuture = logStream.getAsyncLogStream().newLogStreamWriter();
 
     // when
     Awaitility.await().until(writerFuture::isDone);

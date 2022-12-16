@@ -11,7 +11,6 @@ import io.camunda.zeebe.engine.processing.bpmn.BpmnElementContext;
 import io.camunda.zeebe.engine.processing.common.EventHandle;
 import io.camunda.zeebe.engine.processing.common.EventTriggerBehavior;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.Writers;
-import io.camunda.zeebe.engine.state.KeyGenerator;
 import io.camunda.zeebe.engine.state.deployment.DeployedProcess;
 import io.camunda.zeebe.engine.state.immutable.MessageStartEventSubscriptionState;
 import io.camunda.zeebe.engine.state.immutable.MessageState;
@@ -19,6 +18,7 @@ import io.camunda.zeebe.engine.state.immutable.ProcessState;
 import io.camunda.zeebe.engine.state.immutable.ZeebeState;
 import io.camunda.zeebe.protocol.impl.record.value.message.MessageStartEventSubscriptionRecord;
 import io.camunda.zeebe.scheduler.clock.ActorClock;
+import io.camunda.zeebe.stream.api.state.KeyGenerator;
 import java.util.Optional;
 import org.agrona.DirectBuffer;
 
@@ -34,6 +34,7 @@ public final class BpmnBufferedMessageStartEventBehavior {
       final ZeebeState zeebeState,
       final KeyGenerator keyGenerator,
       final EventTriggerBehavior eventTriggerBehavior,
+      final BpmnStateBehavior stateBehavior,
       final Writers writers) {
     messageState = zeebeState.getMessageState();
     processState = zeebeState.getProcessState();
@@ -45,7 +46,8 @@ public final class BpmnBufferedMessageStartEventBehavior {
             zeebeState.getEventScopeInstanceState(),
             writers,
             processState,
-            eventTriggerBehavior);
+            eventTriggerBehavior,
+            stateBehavior);
   }
 
   public Optional<DirectBuffer> findCorrelationKey(final BpmnElementContext context) {

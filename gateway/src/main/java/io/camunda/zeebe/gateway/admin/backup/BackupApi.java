@@ -7,6 +7,7 @@
  */
 package io.camunda.zeebe.gateway.admin.backup;
 
+import java.util.List;
 import java.util.concurrent.CompletionStage;
 
 public interface BackupApi {
@@ -34,4 +35,16 @@ public interface BackupApi {
    * @return the status of the backup
    */
   CompletionStage<BackupStatus> getStatus(long backupId);
+
+  /**
+   * @return a list of available backups
+   */
+  CompletionStage<List<BackupStatus>> listBackups();
+
+  /**
+   * Deletes the backup with the given id
+   *
+   * @param backupId id of the backup to delete
+   */
+  CompletionStage<Void> deleteBackup(long backupId);
 }

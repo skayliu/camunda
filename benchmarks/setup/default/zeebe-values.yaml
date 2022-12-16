@@ -16,9 +16,9 @@ zeebe:
   replicationFactor: "3"
 
   # CpuThreadCount defines how many threads can be used for the processing on each broker pod
-  cpuThreadCount: 4
+  cpuThreadCount: 3
   # IoThreadCount defines how many threads can be used for the exporting on each broker pod
-  ioThreadCount: 4
+  ioThreadCount: 3
 
   # ContainerSecurityContext defines the security options the Zeebe broker container should be run with
   containerSecurityContext:
@@ -60,14 +60,18 @@ zeebe:
     - name: ZEEBE_BROKER_EXPERIMENTAL_CONSISTENCYCHECKS_ENABLEFOREIGNKEYCHECKS
       value: "true"
 
+  # Enable metrics collections
+  podLabels:
+    metrics: gmp
+
   # Resources configuration to set request and limit configuration for the container https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#requests-and-limitsS
   resources:
     limits:
-      cpu: 5
+      cpu: 960m
       memory: 4Gi
     requests:
-      cpu: 5
-      memory: 4Gi
+      cpu: 800m
+      memory: 2Gi
 
   # PvcAccessModes can be used to configure the persistent volume claim access mode https://kubernetes.io/docs/concepts/storage/persistent-volumes/#access-modes
   pvcAccessMode: ["ReadWriteOnce"]
@@ -78,7 +82,8 @@ zeebe:
 
 zeebe-gateway:
   # Replicas defines how many standalone gateways are deployed
-  replicas: 3
+  replicas: 2
+
   # Image configuration to configure the zeebe-gateway image specifics
   image:
     # Image.repository defines which image repository to use
@@ -105,14 +110,18 @@ zeebe-gateway:
     - name: ZEEBE_GATEWAY_THREADS_MANAGEMENTTHREADS
       value: "1"
 
+  # Enable metrics collections
+  podLabels:
+    metrics: gmp
+
   # Resources configuration to set request and limit configuration for the container https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#requests-and-limits
   resources:
     limits:
-      cpu: 1
-      memory: 512Mi
+      cpu: 450m
+      memory: 400Mi
     requests:
-      cpu: 1
-      memory: 512Mi
+      cpu: 450m
+      memory: 400Mi
 
 # RetentionPolicy configuration to configure the elasticsearch index retention policies
 retentionPolicy:
@@ -156,19 +165,18 @@ elasticsearch:
     storageClassName: "ssd"
     resources:
       requests:
-        storage: 50Gi
+        storage: 64Gi
 
-  esJavaOpts: "-Xmx4g -Xms4g"
+  esJavaOpts: "-Xmx3g -Xms3g"
 
   resources:
     requests:
-      cpu: 3
-      memory: 8Gi
+      cpu: 1
+      memory: 3Gi
     limits:
-      cpu: 3
-      memory: 8Gi
+      cpu: 2
+      memory: 6Gi
 
-# PrometheusServiceMonitor configuration for the prometheus service monitor
+# Disable the service monitor as we use Google Managed Prometheus
 prometheusServiceMonitor:
-  # PrometheusServiceMonitor.enabled if true then a service monitor will be deployed, which allows a installed prometheus controller to scrape metrics from the broker pods
-  enabled: true
+  enabled: false

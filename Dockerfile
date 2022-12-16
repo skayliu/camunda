@@ -1,8 +1,11 @@
-# Override this based on the architecture; this is currently pointing to amd64
-ARG BASE_SHA="4da6bae253f3cb77d87a98e78459ab85ab119a53aa2c66914981588a374f0627"
+# This Dockerfile requires BuildKit to be enabled, by setting the environment variable
+# DOCKER_BUILDKIT=1
+# see https://docs.docker.com/build/buildkit/#getting-started
+ARG BASE_DIGEST_AMD64="sha256:e0835d0b51dfc2bd8f3b97ff7d819d1e7d09ab906309ae8d2b3e9395a6c60a2f"
+ARG BASE_DIGEST_ARM64="sha256:b10a9774578bd45ab68cd48f850cc09f49690606e4e9ead0babdee522f4fa5c7"
 
-# Building builder image
-FROM ubuntu:focal as builder
+#### Builder image ####
+FROM ubuntu:jammy as builder
 ARG DISTBALL
 
 ENV TMP_ARCHIVE=/tmp/zeebe.tar.gz \
@@ -15,25 +18,40 @@ RUN mkdir -p ${TMP_DIR} && \
     # already create volume dir to later have correct rights
     mkdir ${TMP_DIR}/data && \
     apt-get -qq update && \
-    apt-get install -y --no-install-recommends tini=0.18.0-1 && \
+    apt-get install -y --no-install-recommends tini=0.19.0-1 && \
     cp /usr/bin/tini ${TMP_DIR}/bin/tini
 
 COPY docker/utils/startup.sh ${TMP_DIR}/bin/startup.sh
 RUN chmod +x -R ${TMP_DIR}/bin/ && \
     chmod 0775 ${TMP_DIR} ${TMP_DIR}/data
 
-# Building application image
+### AMD64 base image ###
+# BASE_DIGEST_AMD64 is defined at the top of the Dockerfile
 # hadolint ignore=DL3006
-FROM eclipse-temurin:17-jre-focal@sha256:${BASE_SHA} as app
+FROM eclipse-temurin:17-jre-focal@${BASE_DIGEST_AMD64} as base-amd64
+ARG BASE_DIGEST_AMD64
+ARG BASE_DIGEST="${BASE_DIGEST_AMD64}"
 
+### ARM64 base image ##
+# BASE_DIGEST_ARM64 is defined at the top of the Dockerfile
+# hadolint ignore=DL3006
+FROM eclipse-temurin:17-jre-focal@${BASE_DIGEST_ARM64} as base-arm64
+ARG BASE_DIGEST_ARM64
+ARG BASE_DIGEST="${BASE_DIGEST_ARM64}"
+
+### Application Image ###
+# TARGETARCH is provided by buildkit
+# https://docs.docker.com/engine/reference/builder/#automatic-platform-args-in-the-global-scope
+# hadolint ignore=DL3006
+FROM base-${TARGETARCH} as app
 # leave unset to use the default value at the top of the file
-ARG BASE_SHA
+ARG BASE_DIGEST
 ARG VERSION=""
 ARG DATE=""
 ARG REVISION=""
 
 # OCI labels: https://github.com/opencontainers/image-spec/blob/main/annotations.md
-LABEL org.opencontainers.image.base.digest="${BASE_SHA}"
+LABEL org.opencontainers.image.base.digest="${BASE_DIGEST}"
 LABEL org.opencontainers.image.base.name="docker.io/library/eclipse-temurin:17-jre-focal"
 LABEL org.opencontainers.image.created="${DATE}"
 LABEL org.opencontainers.image.authors="zeebe@camunda.com"

@@ -8,9 +8,8 @@
 package io.camunda.zeebe.logstreams.util;
 
 import io.camunda.zeebe.logstreams.log.LogStream;
-import io.camunda.zeebe.logstreams.log.LogStreamBatchWriter;
 import io.camunda.zeebe.logstreams.log.LogStreamReader;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
 
 /**
  * This synchronous log stream interface is only for testing purposes.
@@ -54,10 +53,24 @@ public interface SynchronousLogStream extends AutoCloseable {
   /**
    * @return a new created log stream record writer
    */
-  LogStreamRecordWriter newLogStreamRecordWriter();
+  LogStreamWriter newLogStreamWriter();
 
   /**
-   * @return a new created log stream batch writer
+   * Returns a wrapped {@link #newLogStreamWriter()} which ensures that every write returns only
+   * when the entry has been added to the underlying storage.
    */
-  LogStreamBatchWriter newLogStreamBatchWriter();
+  SynchronousLogStreamWriter newSyncLogStreamWriter();
+
+  /**
+   * Force waiting until the given position has been persisted in the underlying storage.
+   *
+   * @param position the written position to wait for
+   */
+  void awaitPositionWritten(final long position);
+
+  /**
+   * Marker interface for a {@link LogStreamWriter} implementation which only returns when the entry
+   * has been written to the underlying storage.
+   */
+  interface SynchronousLogStreamWriter extends LogStreamWriter {}
 }

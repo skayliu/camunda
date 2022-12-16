@@ -12,19 +12,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.camunda.zeebe.db.DbKey;
 import io.camunda.zeebe.db.DbValue;
-import io.camunda.zeebe.engine.api.CommandResponseWriter;
-import io.camunda.zeebe.engine.api.InterPartitionCommandSender;
-import io.camunda.zeebe.engine.api.ReadonlyStreamProcessorContext;
-import io.camunda.zeebe.engine.api.StreamProcessorLifecycleAware;
-import io.camunda.zeebe.engine.api.TypedRecord;
 import io.camunda.zeebe.engine.processing.EngineProcessors;
 import io.camunda.zeebe.engine.processing.deployment.distribute.DeploymentDistributionCommandSender;
 import io.camunda.zeebe.engine.processing.message.command.SubscriptionCommandSender;
-import io.camunda.zeebe.engine.processing.streamprocessor.RecordValues;
 import io.camunda.zeebe.engine.state.DefaultZeebeDbFactory;
-import io.camunda.zeebe.engine.state.ZbColumnFamilies;
 import io.camunda.zeebe.engine.state.ZeebeDbState;
 import io.camunda.zeebe.engine.state.immutable.ZeebeState;
+import io.camunda.zeebe.engine.util.client.DecisionEvaluationClient;
 import io.camunda.zeebe.engine.util.client.DeploymentClient;
 import io.camunda.zeebe.engine.util.client.IncidentClient;
 import io.camunda.zeebe.engine.util.client.JobActivationClient;
@@ -32,13 +26,15 @@ import io.camunda.zeebe.engine.util.client.JobClient;
 import io.camunda.zeebe.engine.util.client.ProcessInstanceClient;
 import io.camunda.zeebe.engine.util.client.PublishMessageClient;
 import io.camunda.zeebe.engine.util.client.VariableClient;
+import io.camunda.zeebe.logstreams.log.LogAppendEntry;
 import io.camunda.zeebe.logstreams.log.LogStreamReader;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
 import io.camunda.zeebe.logstreams.log.LoggedEvent;
 import io.camunda.zeebe.logstreams.util.ListLogStorage;
 import io.camunda.zeebe.logstreams.util.SynchronousLogStream;
 import io.camunda.zeebe.model.bpmn.Bpmn;
 import io.camunda.zeebe.protocol.Protocol;
+import io.camunda.zeebe.protocol.ZbColumnFamilies;
 import io.camunda.zeebe.protocol.impl.encoding.MsgPackConverter;
 import io.camunda.zeebe.protocol.impl.record.RecordMetadata;
 import io.camunda.zeebe.protocol.impl.record.UnifiedRecordValue;
@@ -52,17 +48,22 @@ import io.camunda.zeebe.protocol.record.value.JobRecordValue;
 import io.camunda.zeebe.scheduler.clock.ControlledActorClock;
 import io.camunda.zeebe.scheduler.future.ActorFuture;
 import io.camunda.zeebe.scheduler.future.CompletableActorFuture;
-import io.camunda.zeebe.streamprocessor.StreamProcessor;
-import io.camunda.zeebe.streamprocessor.StreamProcessor.Phase;
-import io.camunda.zeebe.streamprocessor.StreamProcessorListener;
-import io.camunda.zeebe.streamprocessor.StreamProcessorMode;
-import io.camunda.zeebe.streamprocessor.TypedRecordImpl;
+import io.camunda.zeebe.stream.api.CommandResponseWriter;
+import io.camunda.zeebe.stream.api.InterPartitionCommandSender;
+import io.camunda.zeebe.stream.api.ReadonlyStreamProcessorContext;
+import io.camunda.zeebe.stream.api.StreamProcessorLifecycleAware;
+import io.camunda.zeebe.stream.api.records.TypedRecord;
+import io.camunda.zeebe.stream.impl.StreamProcessor;
+import io.camunda.zeebe.stream.impl.StreamProcessor.Phase;
+import io.camunda.zeebe.stream.impl.StreamProcessorListener;
+import io.camunda.zeebe.stream.impl.StreamProcessorMode;
+import io.camunda.zeebe.stream.impl.records.RecordValues;
+import io.camunda.zeebe.stream.impl.records.TypedRecordImpl;
 import io.camunda.zeebe.test.util.TestUtil;
 import io.camunda.zeebe.test.util.record.RecordingExporter;
 import io.camunda.zeebe.test.util.record.RecordingExporterTestWatcher;
 import io.camunda.zeebe.util.FeatureFlags;
 import io.camunda.zeebe.util.buffer.BufferUtil;
-import io.camunda.zeebe.util.buffer.BufferWriter;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -72,7 +73,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -89,7 +89,6 @@ import org.junit.runners.model.Statement;
 public final class EngineRule extends ExternalResource {
 
   private static final int PARTITION_ID = Protocol.DEPLOYMENT_PARTITION;
-  private static final int REPROCESSING_TIMEOUT_SEC = 30;
   private static final RecordingExporter RECORDING_EXPORTER = new RecordingExporter();
   private final StreamProcessorRule environmentRule;
   private final RecordingExporterTestWatcher recordingExporterTestWatcher =
@@ -220,12 +219,6 @@ public final class EngineRule extends ExternalResource {
     interPartitionCommandSenders.forEach(s -> s.initializeWriters(partitionCount));
   }
 
-  public void awaitReprocessingCompleted() {
-    partitionReprocessingCompleteListeners
-        .values()
-        .forEach(ReprocessingCompletedListener::awaitReprocessingComplete);
-  }
-
   public void forEachPartition(final Consumer<Integer> partitionIdConsumer) {
     int partitionId = PARTITION_ID;
     for (int i = 0; i < partitionCount; i++) {
@@ -289,10 +282,6 @@ public final class EngineRule extends ExternalResource {
     return environmentRule.getStreamProcessor(partitionId);
   }
 
-  public long getLastWrittenPosition(final int partitionId) {
-    return environmentRule.getLastWrittenPosition(partitionId);
-  }
-
   public long getLastProcessedPosition() {
     return lastProcessedPosition;
   }
@@ -303,6 +292,10 @@ public final class EngineRule extends ExternalResource {
 
   public ProcessInstanceClient processInstance() {
     return new ProcessInstanceClient(environmentRule);
+  }
+
+  public DecisionEvaluationClient decision() {
+    return new DecisionEvaluationClient(environmentRule);
   }
 
   public PublishMessageClient message() {
@@ -502,22 +495,18 @@ public final class EngineRule extends ExternalResource {
     public void onRecovered(final ReadonlyStreamProcessorContext context) {
       reprocessingComplete.complete(null);
     }
-
-    public void awaitReprocessingComplete() {
-      reprocessingComplete.join(REPROCESSING_TIMEOUT_SEC, TimeUnit.SECONDS);
-    }
   }
 
   private class TestInterPartitionCommandSender implements InterPartitionCommandSender {
 
-    private final Map<Integer, LogStreamRecordWriter> writers = new HashMap<>();
+    private final Map<Integer, LogStreamWriter> writers = new HashMap<>();
 
     @Override
     public void sendCommand(
         final int receiverPartitionId,
         final ValueType valueType,
         final Intent intent,
-        final BufferWriter command) {
+        final UnifiedRecordValue command) {
       sendCommand(receiverPartitionId, valueType, intent, null, command);
     }
 
@@ -527,15 +516,18 @@ public final class EngineRule extends ExternalResource {
         final ValueType valueType,
         final Intent intent,
         final Long recordKey,
-        final BufferWriter command) {
+        final UnifiedRecordValue command) {
       final var metadata =
           new RecordMetadata().recordType(RecordType.COMMAND).intent(intent).valueType(valueType);
       final var writer = writers.get(receiverPartitionId);
-      writer.reset();
+      final LogAppendEntry entry;
       if (recordKey != null) {
-        writer.key(recordKey);
+        entry = LogAppendEntry.of(recordKey, metadata, command);
+      } else {
+        entry = LogAppendEntry.of(metadata, command);
       }
-      writer.metadataWriter(metadata).valueWriter(command).tryWrite();
+
+      writer.tryWrite(entry);
     }
 
     // Pre-initialize dedicated writers.
@@ -544,7 +536,7 @@ public final class EngineRule extends ExternalResource {
     // context where we can't build new `SyncLogStream`s.
     private void initializeWriters(final int partitionCount) {
       for (int i = PARTITION_ID; i < PARTITION_ID + partitionCount; i++) {
-        writers.put(i, environmentRule.newLogStreamRecordWriter(i));
+        writers.put(i, environmentRule.newLogStreamWriter(i));
       }
     }
   }

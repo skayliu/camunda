@@ -80,7 +80,7 @@ public final class BusinessRuleTaskProcessor
     public CalledDecisionBehavior(
         final BpmnBehaviors bpmnBehaviors,
         final BpmnStateTransitionBehavior stateTransitionBehavior) {
-      decisionBehavior = bpmnBehaviors.decisionBehavior();
+      decisionBehavior = bpmnBehaviors.bpmnDecisionBehavior();
       eventSubscriptionBehavior = bpmnBehaviors.eventSubscriptionBehavior();
       incidentBehavior = bpmnBehaviors.incidentBehavior();
       this.stateTransitionBehavior = stateTransitionBehavior;
@@ -123,6 +123,7 @@ public final class BusinessRuleTaskProcessor
       eventSubscriptionBehavior
           .findEventTrigger(context)
           .filter(eventTrigger -> flowScopeInstance.isActive())
+          .filter(eventTrigger -> !flowScopeInstance.isInterrupted())
           .ifPresentOrElse(
               eventTrigger -> {
                 final var terminated = stateTransitionBehavior.transitionToTerminated(context);

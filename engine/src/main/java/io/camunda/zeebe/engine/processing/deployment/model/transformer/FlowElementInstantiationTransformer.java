@@ -23,6 +23,7 @@ import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableInt
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableJobWorkerTask;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableProcess;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableReceiveTask;
+import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableScriptTask;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableSequenceFlow;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableStartEvent;
 import io.camunda.zeebe.engine.processing.deployment.model.transformation.ModelElementTransformer;
@@ -31,6 +32,9 @@ import io.camunda.zeebe.model.bpmn.instance.Activity;
 import io.camunda.zeebe.model.bpmn.instance.BoundaryEvent;
 import io.camunda.zeebe.model.bpmn.instance.BusinessRuleTask;
 import io.camunda.zeebe.model.bpmn.instance.CallActivity;
+import io.camunda.zeebe.model.bpmn.instance.DataObject;
+import io.camunda.zeebe.model.bpmn.instance.DataObjectReference;
+import io.camunda.zeebe.model.bpmn.instance.DataStoreReference;
 import io.camunda.zeebe.model.bpmn.instance.EndEvent;
 import io.camunda.zeebe.model.bpmn.instance.EventBasedGateway;
 import io.camunda.zeebe.model.bpmn.instance.ExclusiveGateway;
@@ -51,13 +55,16 @@ import io.camunda.zeebe.model.bpmn.instance.Task;
 import io.camunda.zeebe.model.bpmn.instance.UserTask;
 import io.camunda.zeebe.protocol.record.value.BpmnElementType;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 public final class FlowElementInstantiationTransformer
     implements ModelElementTransformer<FlowElement> {
 
   private static final Map<Class<?>, Function<String, AbstractFlowElement>> ELEMENT_FACTORIES;
+  private static final Set<Class<?>> NON_EXECUTABLE_ELEMENT_TYPES = new HashSet<>();
 
   static {
     ELEMENT_FACTORIES = new HashMap<>();
@@ -76,13 +83,17 @@ public final class FlowElementInstantiationTransformer
     ELEMENT_FACTORIES.put(Task.class, ExecutableActivity::new);
     ELEMENT_FACTORIES.put(ParallelGateway.class, ExecutableFlowNode::new);
     ELEMENT_FACTORIES.put(ReceiveTask.class, ExecutableReceiveTask::new);
-    ELEMENT_FACTORIES.put(ScriptTask.class, ExecutableJobWorkerTask::new);
+    ELEMENT_FACTORIES.put(ScriptTask.class, ExecutableScriptTask::new);
     ELEMENT_FACTORIES.put(SendTask.class, ExecutableJobWorkerTask::new);
     ELEMENT_FACTORIES.put(SequenceFlow.class, ExecutableSequenceFlow::new);
     ELEMENT_FACTORIES.put(ServiceTask.class, ExecutableJobWorkerTask::new);
     ELEMENT_FACTORIES.put(StartEvent.class, ExecutableStartEvent::new);
     ELEMENT_FACTORIES.put(SubProcess.class, ExecutableFlowElementContainer::new);
     ELEMENT_FACTORIES.put(UserTask.class, ExecutableJobWorkerTask::new);
+
+    NON_EXECUTABLE_ELEMENT_TYPES.add(DataObject.class);
+    NON_EXECUTABLE_ELEMENT_TYPES.add(DataObjectReference.class);
+    NON_EXECUTABLE_ELEMENT_TYPES.add(DataStoreReference.class);
   }
 
   @Override
@@ -95,16 +106,20 @@ public final class FlowElementInstantiationTransformer
     final ExecutableProcess process = context.getCurrentProcess();
     final Class<?> elementType = element.getElementType().getInstanceType();
 
-    final Function<String, AbstractFlowElement> elementFactory = ELEMENT_FACTORIES.get(elementType);
-    if (elementFactory == null) {
-      throw new IllegalStateException("no transformer found for element type: " + elementType);
+    if (!NON_EXECUTABLE_ELEMENT_TYPES.contains(elementType)) {
+
+      final Function<String, AbstractFlowElement> elementFactory =
+          ELEMENT_FACTORIES.get(elementType);
+      if (elementFactory == null) {
+        throw new IllegalStateException("no transformer found for element type: " + elementType);
+      }
+
+      final AbstractFlowElement executableElement = elementFactory.apply(element.getId());
+
+      executableElement.setElementType(
+          BpmnElementType.bpmnElementTypeFor(element.getElementType().getTypeName()));
+
+      process.addFlowElement(executableElement);
     }
-
-    final AbstractFlowElement executableElement = elementFactory.apply(element.getId());
-
-    executableElement.setElementType(
-        BpmnElementType.bpmnElementTypeFor(element.getElementType().getTypeName()));
-
-    process.addFlowElement(executableElement);
   }
 }

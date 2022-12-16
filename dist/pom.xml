@@ -159,11 +159,47 @@
       <artifactId>spring-context</artifactId>
     </dependency>
 
+    <!-- Following are used for generating models from open api spec   -->
+    <dependency>
+      <groupId>javax.validation</groupId>
+      <artifactId>validation-api</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.openapitools</groupId>
+      <artifactId>jackson-databind-nullable</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-annotations</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.swagger.core.v3</groupId>
+      <artifactId>swagger-annotations</artifactId>
+    </dependency>
+
     <!--
       the following are only used in tests, but we cannot scope them as tests as they're transitive
       dependencies required at runtime by other modules; if we scope them as tests here, they will
       be omitted from the resulting artifact, causing ClassNotFoundException errors at runtime
       -->
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>io.netty</groupId>
@@ -178,6 +214,11 @@
     <dependency>
       <groupId>io.camunda</groupId>
       <artifactId>zeebe-protocol</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>io.netty</groupId>
+      <artifactId>netty-transport</artifactId>
     </dependency>
 
     <!-- /end -->
@@ -285,10 +326,17 @@
             <configuration>
               <target>
                 <?SORTPOM IGNORE?> <!-- ordering is important here, chmod needs to run after copying -->
-                <copy failonerror="${zbctl.force}" file="${zbctl.rootDir}/clients/go/cmd/zbctl/dist/zbctl.exe" tofile="${project.build.directory}/camunda-zeebe/bin/zbctl.exe" />
-                <copy failonerror="${zbctl.force}" file="${zbctl.rootDir}/clients/go/cmd/zbctl/dist/zbctl.darwin" tofile="${project.build.directory}/camunda-zeebe/bin/zbctl.darwin" />
-                <copy failonerror="${zbctl.force}" file="${zbctl.rootDir}/clients/go/cmd/zbctl/dist/zbctl" tofile="${project.build.directory}/camunda-zeebe/bin/zbctl" />
-                <chmod dir="${project.build.directory}/camunda-zeebe/bin" failonerror="${zbctl.force}" includes="zbctl*" perm="ugo+rx" />
+                <copy failonerror="${zbctl.force}"
+                  file="${zbctl.rootDir}/clients/go/cmd/zbctl/dist/zbctl.exe"
+                  tofile="${project.build.directory}/camunda-zeebe/bin/zbctl.exe"/>
+                <copy failonerror="${zbctl.force}"
+                  file="${zbctl.rootDir}/clients/go/cmd/zbctl/dist/zbctl.darwin"
+                  tofile="${project.build.directory}/camunda-zeebe/bin/zbctl.darwin"/>
+                <copy failonerror="${zbctl.force}"
+                  file="${zbctl.rootDir}/clients/go/cmd/zbctl/dist/zbctl"
+                  tofile="${project.build.directory}/camunda-zeebe/bin/zbctl"/>
+                <chmod dir="${project.build.directory}/camunda-zeebe/bin"
+                  failonerror="${zbctl.force}" includes="zbctl*" perm="ugo+rx"/>
                 <?SORTPOM RESUME?>
               </target>
             </configuration>
@@ -323,6 +371,9 @@
             <ignoredNonTestScopedDependency>org.agrona:agrona</ignoredNonTestScopedDependency>
             <ignoredNonTestScopedDependency>io.netty:netty-handler</ignoredNonTestScopedDependency>
             <ignoredNonTestScopedDependency>io.camunda:zeebe-protocol</ignoredNonTestScopedDependency>
+            <ignoredNonTestScopedDependency>com.fasterxml.jackson.core:jackson-core</ignoredNonTestScopedDependency>
+            <ignoredNonTestScopedDependency>com.fasterxml.jackson.datatype:jackson-datatype-jsr310</ignoredNonTestScopedDependency>
+            <ignoredNonTestScopedDependency>com.fasterxml.jackson.core:jackson-databind</ignoredNonTestScopedDependency>
           </ignoredNonTestScopedDependencies>
           <!-- dependencies only packaged but not explicitly used -->
           <usedDependencies>
@@ -333,8 +384,39 @@
             <dependency>io.micrometer:micrometer-core</dependency>
             <dependency>io.micrometer:micrometer-registry-prometheus</dependency>
 
+            <dependency>org.openapitools:jackson-databind-nullable</dependency>
+
           </usedDependencies>
         </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.openapitools</groupId>
+        <artifactId>openapi-generator-maven-plugin</artifactId>
+        <version>6.2.1</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>generate</goal>
+            </goals>
+            <configuration>
+              <!-- https://github.com/OpenAPITools/openapi-generator/tree/master/modules/openapi-generator-maven-plugin -->
+              <!-- https://github.com/OpenAPITools/openapi-generator/blob/master/docs/generators/spring.md -->
+              <inputSpec>${project.basedir}/src/main/resources/api/backup-management-api.yaml</inputSpec>
+              <generatorName>spring</generatorName>
+              <modelPackage>io.camunda.zeebe.shared.management.openapi.models</modelPackage>
+              <!-- Do no generate full server stub. Generate only classes for request and response types.  -->
+              <generateApis>false</generateApis>
+              <generateApiTests>false</generateApiTests>
+              <generateSupportingFiles>false</generateSupportingFiles>
+              <generateModels>true</generateModels>
+              <configOptions>
+                <sourceFolder>src/main</sourceFolder>
+                <additionalModelTypeAnnotations>@com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)</additionalModelTypeAnnotations>
+              </configOptions>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

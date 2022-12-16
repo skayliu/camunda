@@ -17,6 +17,7 @@ import io.camunda.zeebe.model.bpmn.builder.EventSubProcessBuilder;
 import io.camunda.zeebe.model.bpmn.builder.SubProcessBuilder;
 import io.camunda.zeebe.protocol.record.Record;
 import io.camunda.zeebe.protocol.record.RecordType;
+import io.camunda.zeebe.protocol.record.intent.IncidentIntent;
 import io.camunda.zeebe.protocol.record.intent.JobIntent;
 import io.camunda.zeebe.protocol.record.intent.ProcessInstanceIntent;
 import io.camunda.zeebe.protocol.record.intent.ProcessInstanceModificationIntent;
@@ -25,9 +26,11 @@ import io.camunda.zeebe.protocol.record.value.BpmnElementType;
 import io.camunda.zeebe.protocol.record.value.ProcessInstanceRecordValue;
 import io.camunda.zeebe.protocol.record.value.ProcessMessageSubscriptionRecordValue;
 import io.camunda.zeebe.protocol.record.value.VariableRecordValue;
+import io.camunda.zeebe.test.util.BrokerClassRuleHelper;
 import io.camunda.zeebe.test.util.record.RecordingExporter;
 import io.camunda.zeebe.test.util.record.RecordingExporterTestWatcher;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -44,6 +47,7 @@ public class ModifyProcessInstanceTest {
   private static final String PROCESS_ID = "process";
 
   @Rule public final TestWatcher watcher = new RecordingExporterTestWatcher();
+  @Rule public final BrokerClassRuleHelper helper = new BrokerClassRuleHelper();
 
   @Test
   public void shouldWriteModifiedEventForProcessInstance() {
@@ -764,7 +768,11 @@ public class ModifyProcessInstanceTest {
         .deploy();
 
     final var processInstanceKey =
-        ENGINE.processInstance().ofBpmnProcessId(PROCESS_ID).withVariable("key", "key-1").create();
+        ENGINE
+            .processInstance()
+            .ofBpmnProcessId(PROCESS_ID)
+            .withVariable("key", helper.getCorrelationValue())
+            .create();
 
     RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
         .withProcessInstanceKey(processInstanceKey)
@@ -774,7 +782,7 @@ public class ModifyProcessInstanceTest {
     ENGINE
         .message()
         .withName("interrupt")
-        .withCorrelationKey("key-1")
+        .withCorrelationKey(helper.getCorrelationValue())
         .withTimeToLive(Duration.ofMinutes(1))
         .publish();
 
@@ -807,6 +815,310 @@ public class ModifyProcessInstanceTest {
                 .limit(2)
                 .count())
         .isEqualTo(2);
+  }
+
+  @Test
+  public void shouldActivateInsideSpecificFlowScopeUsingAncestorSelection() {
+    // given
+    ENGINE
+        .deployment()
+        .withXmlResource(
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .eventSubProcess(
+                    "event-sub",
+                    sub ->
+                        sub.startEvent()
+                            .message(m -> m.name("msg").zeebeCorrelationKeyExpression("key"))
+                            .interrupting(false)
+                            .userTask("A")
+                            .userTask("B")
+                            .endEvent())
+                .startEvent()
+                .userTask("C")
+                .done())
+        .deploy();
+
+    final var processInstanceKey =
+        ENGINE
+            .processInstance()
+            .ofBpmnProcessId(PROCESS_ID)
+            .withVariable("key", helper.getCorrelationValue())
+            .create();
+
+    ENGINE.message().withName("msg").withCorrelationKey(helper.getCorrelationValue()).publish();
+    ENGINE.message().withName("msg").withCorrelationKey(helper.getCorrelationValue()).publish();
+
+    final List<Long> eventSubProcessKeys =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withProcessInstanceKey(processInstanceKey)
+            .withElementType(BpmnElementType.EVENT_SUB_PROCESS)
+            .limit(2)
+            .map(Record::getKey)
+            .toList();
+    assertThat(eventSubProcessKeys)
+        .describedAs("Expect that there are 2 active instances of the event sub process")
+        .hasSize(2);
+
+    // when
+    final var ancestorScopeKey = eventSubProcessKeys.get(1);
+    ENGINE
+        .processInstance()
+        .withInstanceKey(processInstanceKey)
+        .modification()
+        .activateElement("B", ancestorScopeKey)
+        .modify();
+
+    // then
+    final var activatedTaskB =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withProcessInstanceKey(processInstanceKey)
+            .withElementId("B")
+            .findAny();
+    assertThat(activatedTaskB).describedAs("Expect that task B is activated").isPresent();
+    assertThat(activatedTaskB.get().getValue())
+        .describedAs("Expect that task B exists inside of flow scope " + ancestorScopeKey)
+        .hasFlowScopeKey(ancestorScopeKey);
+  }
+
+  @Test
+  public void shouldActivateInsideNestedSpecificFlowScopeUsingAncestorSelection() {
+    // given
+    ENGINE
+        .deployment()
+        .withXmlResource(
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .startEvent()
+                .subProcess("sub")
+                .embeddedSubProcess()
+                .startEvent()
+                .exclusiveGateway("split")
+                .defaultFlow()
+                .userTask("A")
+                .userTask("C")
+                .exclusiveGateway("join")
+                .moveToLastExclusiveGateway()
+                .conditionExpression("false")
+                .userTask("B")
+                .connectTo("join")
+                .endEvent()
+                .subProcessDone()
+                .endEvent()
+                .done())
+        .deploy();
+
+    final var processInstanceKey = ENGINE.processInstance().ofBpmnProcessId(PROCESS_ID).create();
+
+    final var activatedTaskA =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withProcessInstanceKey(processInstanceKey)
+            .withElementId("A")
+            .findAny();
+    assertThat(activatedTaskA).isPresent();
+
+    // when
+    final var ancestorScopeKey = processInstanceKey;
+    final var modifiedRecord =
+        ENGINE
+            .processInstance()
+            .withInstanceKey(processInstanceKey)
+            .modification()
+            .activateElement("B", ancestorScopeKey)
+            .modify();
+
+    // then
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+                .withProcessInstanceKey(processInstanceKey)
+                .skipUntil(r -> r.getPosition() >= modifiedRecord.getSourceRecordPosition())
+                .limit(2))
+        .extracting(Record::getValue)
+        .extracting(ProcessInstanceRecordValue::getElementId)
+        .describedAs("Expect that a new instance of the sub process and task B have been activated")
+        .containsExactly("sub", "B");
+  }
+
+  @Test
+  public void shouldActivateInsideNestedSpecificFlowScopeUsingAncestorSelectionWhenMultipleExist() {
+    // given
+    ENGINE
+        .deployment()
+        .withXmlResource(
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .eventSubProcess(
+                    "event-sub",
+                    sub ->
+                        sub.startEvent()
+                            .message(m -> m.name("msg").zeebeCorrelationKeyExpression("key"))
+                            .interrupting(false)
+                            .userTask("A")
+                            .userTask("B")
+                            .endEvent())
+                .startEvent()
+                .userTask("C")
+                .endEvent()
+                .done())
+        .deploy();
+
+    final var processInstanceKey =
+        ENGINE
+            .processInstance()
+            .ofBpmnProcessId(PROCESS_ID)
+            .withVariable("key", helper.getCorrelationValue())
+            .create();
+
+    ENGINE.message().withName("msg").withCorrelationKey(helper.getCorrelationValue()).publish();
+    ENGINE.message().withName("msg").withCorrelationKey(helper.getCorrelationValue()).publish();
+
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+                .withProcessInstanceKey(processInstanceKey)
+                .withElementId("A")
+                .limit(2))
+        .describedAs(
+            "Expect that task A activated twice and there are 2 active instances of the event sub process")
+        .hasSize(2);
+
+    // when
+    final var ancestorScopeKey = processInstanceKey;
+    final var modifiedRecord =
+        ENGINE
+            .processInstance()
+            .withInstanceKey(processInstanceKey)
+            .modification()
+            .activateElement("B", ancestorScopeKey)
+            .modify();
+
+    // then
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+                .withProcessInstanceKey(processInstanceKey)
+                .skipUntil(r -> r.getPosition() >= modifiedRecord.getSourceRecordPosition())
+                .limit(2))
+        .extracting(Record::getValue)
+        .extracting(ProcessInstanceRecordValue::getElementId)
+        .describedAs("Expect that a new instance of the sub process and task B have been activated")
+        .containsExactly("event-sub", "B");
+  }
+
+  @Test
+  public void shouldUseAncestorSelectionWithMultiInstancesOfNestedInstances() {
+    // given
+    ENGINE
+        .deployment()
+        .withXmlResource(
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .eventSubProcess(
+                    "event-sub",
+                    sub ->
+                        sub.zeebeInputExpression("null", "key2")
+                            .startEvent()
+                            .message(m -> m.name("msg").zeebeCorrelationKeyExpression("key"))
+                            .interrupting(false)
+                            .userTask("A")
+                            .boundaryEvent(
+                                "boundary",
+                                b ->
+                                    b.cancelActivity(false)
+                                        .message(
+                                            m ->
+                                                m.name("msg2")
+                                                    .zeebeCorrelationKeyExpression("key2"))
+                                        .subProcess("sub")
+                                        .embeddedSubProcess()
+                                        .startEvent()
+                                        .userTask("B")
+                                        .userTask("C")
+                                        .endEvent()
+                                        .subProcessDone()
+                                        .endEvent()))
+                .startEvent()
+                .userTask("D")
+                .endEvent()
+                .done())
+        .deploy();
+
+    final var processInstanceKey =
+        ENGINE
+            .processInstance()
+            .ofBpmnProcessId(PROCESS_ID)
+            .withVariable("key", helper.getCorrelationValue())
+            .create();
+
+    ENGINE
+        .message()
+        .withName("msg")
+        .withCorrelationKey(helper.getCorrelationValue())
+        .withVariables(Map.of("key2", helper.getCorrelationValue() + "1"))
+        .publish();
+    ENGINE
+        .message()
+        .withName("msg")
+        .withCorrelationKey(helper.getCorrelationValue())
+        .withVariables(Map.of("key2", helper.getCorrelationValue() + "2"))
+        .publish();
+
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+                .withProcessInstanceKey(processInstanceKey)
+                .withElementId("A")
+                .limit(2))
+        .describedAs("Expect that task A activated 2 times")
+        .hasSize(2);
+
+    ENGINE
+        .message()
+        .withName("msg2")
+        .withCorrelationKey(helper.getCorrelationValue() + "1")
+        .publish();
+    ENGINE
+        .message()
+        .withName("msg2")
+        .withCorrelationKey(helper.getCorrelationValue() + "1")
+        .publish();
+    ENGINE
+        .message()
+        .withName("msg2")
+        .withCorrelationKey(helper.getCorrelationValue() + "2")
+        .publish();
+    ENGINE
+        .message()
+        .withName("msg2")
+        .withCorrelationKey(helper.getCorrelationValue() + "2")
+        .publish();
+
+    final var flowscopekeys =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withProcessInstanceKey(processInstanceKey)
+            .withElementId("B")
+            .limit(4)
+            .map(Record::getValue)
+            .map(ProcessInstanceRecordValue::getFlowScopeKey)
+            .toList();
+    assertThat(flowscopekeys)
+        .describedAs("Expect that task B activated 4 times, twice per event-subprocess instance")
+        .hasSize(4);
+
+    // when
+    final var ancestorScopeKey = flowscopekeys.get(0);
+    final var modifiedRecord =
+        ENGINE
+            .processInstance()
+            .withInstanceKey(processInstanceKey)
+            .modification()
+            .activateElement("C", ancestorScopeKey)
+            .modify();
+
+    // then
+    final var activatedTask =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withProcessInstanceKey(processInstanceKey)
+            .skipUntil(r -> r.getPosition() >= modifiedRecord.getSourceRecordPosition())
+            .limit(1)
+            .getFirst();
+    assertThat(activatedTask.getValue())
+        .describedAs("Expect that task C has been activated")
+        .hasElementId("C")
+        .hasFlowScopeKey(ancestorScopeKey);
   }
 
   @Test
@@ -848,6 +1160,54 @@ public class ModifyProcessInstanceTest {
                 .withProcessInstanceKey(processInstanceKey)
                 .limit(4))
         .hasSize(4);
+  }
+
+  @Test
+  public void verifyCallActivityWithIncidentInOutputMappingCanBeTerminated() {
+    final var child = Bpmn.createExecutableProcess("child").startEvent().endEvent().done();
+    final var parent =
+        Bpmn.createExecutableProcess(PROCESS_ID)
+            .startEvent()
+            .callActivity("callActivity", c -> c.zeebeProcessId("child"))
+            .zeebeOutputExpression("x", "y")
+            .manualTask("task")
+            .endEvent()
+            .done();
+
+    ENGINE.deployment().withXmlResource(child).withXmlResource(parent).deploy();
+
+    final var processInstanceKey = ENGINE.processInstance().ofBpmnProcessId(PROCESS_ID).create();
+
+    final var callActivityElement =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withProcessInstanceKey(processInstanceKey)
+            .withElementId("callActivity")
+            .withElementType(BpmnElementType.CALL_ACTIVITY)
+            .getFirst();
+
+    Assertions.assertThat(
+            RecordingExporter.incidentRecords(IncidentIntent.CREATED)
+                .withProcessInstanceKey(processInstanceKey)
+                .getFirst())
+        .extracting(r -> r.getValue().getElementId())
+        .isEqualTo("callActivity");
+
+    ENGINE
+        .processInstance()
+        .withInstanceKey(processInstanceKey)
+        .modification()
+        .activateElement("task")
+        .terminateElement(callActivityElement.getKey())
+        .modify();
+
+    verifyThatRootElementIsActivated(processInstanceKey, "task", BpmnElementType.MANUAL_TASK);
+    verifyThatProcessInstanceIsCompleted(processInstanceKey);
+    Assertions.assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_TERMINATED)
+                .withProcessInstanceKey(processInstanceKey)
+                .withElementId(callActivityElement.getValue().getElementId())
+                .exists())
+        .isTrue();
   }
 
   private static void verifyThatRootElementIsActivated(
@@ -911,6 +1271,77 @@ public class ModifyProcessInstanceTest {
                 flowScopeKey,
                 -1L,
                 -1L));
+  }
+
+  @Test
+  public void shouldUseAncestorSelectionInsideMultiInstances() throws InterruptedException {
+    // given
+    ENGINE
+        .deployment()
+        .withXmlResource(
+            Bpmn.createExecutableProcess(PROCESS_ID)
+                .startEvent()
+                .subProcess(
+                    "SubProcess",
+                    sub ->
+                        sub.multiInstance(
+                            m ->
+                                m.zeebeInputCollectionExpression("[1,2,3]")
+                                    .zeebeInputElement("index")
+                                    .parallel()))
+                .embeddedSubProcess()
+                .startEvent()
+                .serviceTask("A", t -> t.zeebeJobType("A"))
+                .serviceTask("B", t -> t.zeebeJobType("B"))
+                .endEvent()
+                .subProcessDone()
+                .endEvent()
+                .done())
+        .deploy();
+
+    final var processInstanceKey = ENGINE.processInstance().ofBpmnProcessId(PROCESS_ID).create();
+    final var aTasks =
+        RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+            .withElementId("A")
+            .limit(3)
+            .toList();
+    assertThat(aTasks).hasSize(3);
+
+    // when
+    ENGINE
+        .processInstance()
+        .withInstanceKey(processInstanceKey)
+        .modification()
+        .terminateElement(aTasks.get(0).getKey())
+        .activateElement("B", aTasks.get(0).getValue().getFlowScopeKey())
+        .terminateElement(aTasks.get(2).getKey())
+        .activateElement("B", aTasks.get(2).getValue().getFlowScopeKey())
+        .modify();
+
+    // then
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_TERMINATED)
+                .withRecordKey(aTasks.get(0).getKey())
+                .exists())
+        .describedAs("Expect first A Task to be terminated")
+        .isTrue();
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_TERMINATED)
+                .withRecordKey(aTasks.get(2).getKey())
+                .exists())
+        .describedAs("Expect third A Task to be terminated")
+        .isTrue();
+    assertThat(
+            RecordingExporter.processInstanceRecords(ProcessInstanceIntent.ELEMENT_ACTIVATED)
+                .withElementId("B")
+                .limit(2))
+        .describedAs("Expect 2 B Tasks to be activated")
+        .hasSize(2)
+        .extracting(Record::getValue)
+        .extracting(ProcessInstanceRecordValue::getFlowScopeKey)
+        .describedAs("Expect each B Task to be activated inside specific flow scopes")
+        .containsExactlyInAnyOrder(
+            aTasks.get(0).getValue().getFlowScopeKey(), aTasks.get(2).getValue().getFlowScopeKey());
   }
 
   private static void verifyThatElementIsCompleted(

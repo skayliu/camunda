@@ -8,7 +8,6 @@
 package io.camunda.zeebe.engine.processing.bpmn.event;
 
 import static io.camunda.zeebe.util.EnsureUtil.ensureNotNull;
-import static io.camunda.zeebe.util.EnsureUtil.ensureNotNullOrEmpty;
 
 import io.camunda.zeebe.engine.processing.bpmn.BpmnElementContext;
 import io.camunda.zeebe.engine.processing.bpmn.BpmnElementProcessor;
@@ -19,8 +18,12 @@ import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnJobBehavior;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnStateBehavior;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnStateTransitionBehavior;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnVariableMappingBehavior;
+import io.camunda.zeebe.engine.processing.common.ExpressionProcessor;
+import io.camunda.zeebe.engine.processing.common.Failure;
 import io.camunda.zeebe.engine.processing.deployment.model.element.ExecutableEndEvent;
+import io.camunda.zeebe.util.Either;
 import java.util.List;
+import org.agrona.DirectBuffer;
 
 public final class EndEventProcessor implements BpmnElementProcessor<ExecutableEndEvent> {
   private final List<EndEventBehavior> endEventBehaviors =
@@ -28,8 +31,10 @@ public final class EndEventProcessor implements BpmnElementProcessor<ExecutableE
           new NoneEndEventBehavior(),
           new ErrorEndEventBehavior(),
           new MessageEndEventBehavior(),
-          new TerminateEndEventBehavior());
+          new TerminateEndEventBehavior(),
+          new EscalationEndEventBehavior());
 
+  private final ExpressionProcessor expressionProcessor;
   private final BpmnEventPublicationBehavior eventPublicationBehavior;
   private final BpmnIncidentBehavior incidentBehavior;
   private final BpmnStateTransitionBehavior stateTransitionBehavior;
@@ -40,6 +45,7 @@ public final class EndEventProcessor implements BpmnElementProcessor<ExecutableE
   public EndEventProcessor(
       final BpmnBehaviors bpmnBehaviors,
       final BpmnStateTransitionBehavior stateTransitionBehavior) {
+    expressionProcessor = bpmnBehaviors.expressionBehavior();
     eventPublicationBehavior = bpmnBehaviors.eventPublicationBehavior();
     incidentBehavior = bpmnBehaviors.incidentBehavior();
     this.stateTransitionBehavior = stateTransitionBehavior;
@@ -126,24 +132,32 @@ public final class EndEventProcessor implements BpmnElementProcessor<ExecutableE
 
     @Override
     public void onActivate(final ExecutableEndEvent element, final BpmnElementContext activating) {
-      final var error = element.getError();
-      ensureNotNull("error", error);
-
-      final var errorCode = error.getErrorCode();
-      ensureNotNullOrEmpty("errorCode", errorCode);
 
       // the error must be caught at the parent or an upper scope (e.g. interrupting boundary event
       // or
       // event sub process). This is also why we don't have to transition to the completing state
       // here
-      eventPublicationBehavior
-          .findErrorCatchEvent(errorCode, activating)
+      evaluateErrorCode(element, activating)
+          .flatMap(errorCode -> eventPublicationBehavior.findErrorCatchEvent(errorCode, activating))
           .ifRightOrLeft(
               catchEvent -> {
                 stateTransitionBehavior.transitionToActivated(activating);
                 eventPublicationBehavior.throwErrorEvent(catchEvent);
               },
               failure -> incidentBehavior.createIncident(failure, activating));
+    }
+
+    private Either<Failure, DirectBuffer> evaluateErrorCode(
+        final ExecutableEndEvent element, final BpmnElementContext context) {
+      final var error = element.getError();
+      ensureNotNull("error", error);
+
+      if (error.getErrorCode().isPresent()) {
+        return Either.right(error.getErrorCode().get());
+      }
+
+      return expressionProcessor.evaluateStringExpressionAsDirectBuffer(
+          error.getErrorCodeExpression(), context.getElementInstanceKey());
     }
   }
 
@@ -202,6 +216,53 @@ public final class EndEventProcessor implements BpmnElementProcessor<ExecutableE
                 stateTransitionBehavior.terminateChildInstances(flowScopeContext);
               },
               failure -> incidentBehavior.createIncident(failure, completing));
+    }
+  }
+
+  private class EscalationEndEventBehavior implements EndEventBehavior {
+    @Override
+    public boolean isSuitableForEvent(final ExecutableEndEvent element) {
+      return element.isEscalationEndEvent();
+    }
+
+    @Override
+    public void onActivate(final ExecutableEndEvent element, final BpmnElementContext activating) {
+      evaluateEscalationCode(element, activating)
+          .ifRightOrLeft(
+              escalationCode -> {
+                final var activated = stateTransitionBehavior.transitionToActivated(activating);
+                final boolean canBeCompleted =
+                    eventPublicationBehavior.throwEscalationEvent(
+                        element.getId(), escalationCode, activated);
+
+                if (canBeCompleted) {
+                  stateTransitionBehavior.completeElement(activated);
+                }
+              },
+              failure -> incidentBehavior.createIncident(failure, activating));
+    }
+
+    @Override
+    public void onComplete(final ExecutableEndEvent element, final BpmnElementContext completing) {
+      variableMappingBehavior
+          .applyOutputMappings(completing, element)
+          .flatMap(ok -> stateTransitionBehavior.transitionToCompleted(element, completing))
+          .ifRightOrLeft(
+              completed -> stateTransitionBehavior.takeOutgoingSequenceFlows(element, completed),
+              failure -> incidentBehavior.createIncident(failure, completing));
+    }
+
+    private Either<Failure, DirectBuffer> evaluateEscalationCode(
+        final ExecutableEndEvent element, final BpmnElementContext context) {
+      final var escalation = element.getEscalation();
+      ensureNotNull("escalation", escalation);
+
+      if (escalation.getEscalationCode().isPresent()) {
+        return Either.right(escalation.getEscalationCode().get());
+      }
+
+      return expressionProcessor.evaluateStringExpressionAsDirectBuffer(
+          escalation.getEscalationCodeExpression(), context.getElementInstanceKey());
     }
   }
 }

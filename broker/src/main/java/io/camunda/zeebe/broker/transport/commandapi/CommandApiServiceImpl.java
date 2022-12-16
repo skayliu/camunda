@@ -14,8 +14,6 @@ import io.camunda.zeebe.broker.system.monitoring.DiskSpaceUsageListener;
 import io.camunda.zeebe.broker.transport.backpressure.PartitionAwareRequestLimiter;
 import io.camunda.zeebe.broker.transport.backpressure.RequestLimiter;
 import io.camunda.zeebe.broker.transport.queryapi.QueryApiRequestHandler;
-import io.camunda.zeebe.engine.api.CommandResponseWriter;
-import io.camunda.zeebe.engine.api.TypedRecord;
 import io.camunda.zeebe.engine.state.QueryService;
 import io.camunda.zeebe.logstreams.log.LogStream;
 import io.camunda.zeebe.protocol.impl.encoding.BrokerInfo;
@@ -25,6 +23,8 @@ import io.camunda.zeebe.scheduler.Actor;
 import io.camunda.zeebe.scheduler.ActorSchedulingService;
 import io.camunda.zeebe.scheduler.future.ActorFuture;
 import io.camunda.zeebe.scheduler.future.CompletableActorFuture;
+import io.camunda.zeebe.stream.api.CommandResponseWriter;
+import io.camunda.zeebe.stream.api.records.TypedRecord;
 import io.camunda.zeebe.transport.RequestType;
 import io.camunda.zeebe.transport.ServerTransport;
 import java.util.function.Consumer;
@@ -109,7 +109,7 @@ public final class CommandApiServiceImpl extends Actor
           serverTransport.subscribe(partitionId, RequestType.QUERY, queryHandler);
 
           logStream
-              .newLogStreamRecordWriter()
+              .newLogStreamWriter()
               .onComplete(
                   (recordWriter, error) -> {
                     if (error == null) {

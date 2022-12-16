@@ -15,8 +15,8 @@ import io.camunda.zeebe.db.impl.DbForeignKey;
 import io.camunda.zeebe.db.impl.DbLong;
 import io.camunda.zeebe.db.impl.DbNil;
 import io.camunda.zeebe.db.impl.DbString;
-import io.camunda.zeebe.engine.state.ZbColumnFamilies;
 import io.camunda.zeebe.engine.state.mutable.MutableDecisionState;
+import io.camunda.zeebe.protocol.ZbColumnFamilies;
 import io.camunda.zeebe.protocol.impl.record.value.deployment.DecisionRecord;
 import io.camunda.zeebe.protocol.impl.record.value.deployment.DecisionRequirementsRecord;
 import java.util.ArrayList;
@@ -103,6 +103,12 @@ public final class DbDecisionState implements MutableDecisionState {
   }
 
   @Override
+  public Optional<PersistedDecision> findDecisionByKey(final long decisionKey) {
+    dbDecisionKey.wrapLong(decisionKey);
+    return Optional.ofNullable(decisionsByKey.get(dbDecisionKey)).map(PersistedDecision::copy);
+  }
+
+  @Override
   public Optional<PersistedDecisionRequirements> findLatestDecisionRequirementsById(
       final DirectBuffer decisionRequirementsId) {
     dbDecisionRequirementsId.wrapBuffer(decisionRequirementsId);
@@ -135,11 +141,6 @@ public final class DbDecisionState implements MutableDecisionState {
         }));
 
     return decisions;
-  }
-
-  private Optional<PersistedDecision> findDecisionByKey(final long decisionKey) {
-    dbDecisionKey.wrapLong(decisionKey);
-    return Optional.ofNullable(decisionsByKey.get(dbDecisionKey)).map(PersistedDecision::copy);
   }
 
   @Override

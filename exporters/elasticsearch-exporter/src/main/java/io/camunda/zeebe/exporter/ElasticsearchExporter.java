@@ -7,6 +7,8 @@
  */
 package io.camunda.zeebe.exporter;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.camunda.zeebe.exporter.ElasticsearchExporterConfiguration.IndexConfiguration;
 import io.camunda.zeebe.exporter.api.Exporter;
 import io.camunda.zeebe.exporter.api.ExporterException;
@@ -15,21 +17,26 @@ import io.camunda.zeebe.exporter.api.context.Controller;
 import io.camunda.zeebe.protocol.record.Record;
 import io.camunda.zeebe.protocol.record.RecordType;
 import io.camunda.zeebe.protocol.record.ValueType;
+import java.io.IOException;
 import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class ElasticsearchExporter implements Exporter {
 
-  public static final String ZEEBE_RECORD_TEMPLATE_JSON = "/zeebe-record-template.json";
-
   // by default, the bulk request may not be bigger than 100MB
   private static final int RECOMMENDED_MAX_BULK_MEMORY_LIMIT = 100 * 1024 * 1024;
 
   private Logger log = LoggerFactory.getLogger(getClass().getPackageName());
+  private final ObjectMapper exporterMetadataObjectMapper = new ObjectMapper();
+
+  private final ElasticsearchExporterMetadata exporterMetadata =
+      new ElasticsearchExporterMetadata();
+
   private Controller controller;
   private ElasticsearchExporterConfiguration configuration;
   private ElasticsearchClient client;
+  private ElasticsearchRecordCounters recordCounters;
 
   private long lastPosition = -1;
   private boolean indexTemplatesCreated;
@@ -51,6 +58,14 @@ public class ElasticsearchExporter implements Exporter {
     this.controller = controller;
     client = createClient();
 
+    recordCounters =
+        controller
+            .readMetadata()
+            .map(this::deserializeExporterMetadata)
+            .map(ElasticsearchExporterMetadata::getRecordCountersByValueType)
+            .map(ElasticsearchRecordCounters::new)
+            .orElse(new ElasticsearchRecordCounters());
+
     scheduleDelayedFlush();
     log.info("Exporter opened");
   }
@@ -60,6 +75,7 @@ public class ElasticsearchExporter implements Exporter {
 
     try {
       flush();
+      updateLastExportedPosition();
     } catch (final Exception e) {
       log.warn("Failed to flush records before closing exporter.", e);
     }
@@ -79,11 +95,21 @@ public class ElasticsearchExporter implements Exporter {
       createIndexTemplates();
     }
 
-    client.index(record);
+    final var recordSequence = recordCounters.getNextRecordSequence(record);
+    client.index(record, recordSequence);
     lastPosition = record.getPosition();
 
     if (client.shouldFlush()) {
       flush();
+      // Update the record counters only after the flush was successful. If the synchronous flush
+      // fails then the exporter will be invoked with the same record again.
+      recordCounters.updateRecordCounters(record, recordSequence);
+      updateLastExportedPosition();
+    } else {
+      // If the exporter doesn't flush synchronously then it can update the record counters
+      // immediately. If the asynchronous flush fails then it will retry only the flush operation
+      // with the records in the pending bulk request.
+      recordCounters.updateRecordCounters(record, recordSequence);
     }
   }
 
@@ -124,6 +150,7 @@ public class ElasticsearchExporter implements Exporter {
   private void flushAndReschedule() {
     try {
       flush();
+      updateLastExportedPosition();
     } catch (final Exception e) {
       log.warn("Unexpected exception occurred on periodically flushing bulk, will retry later.", e);
     }
@@ -137,7 +164,28 @@ public class ElasticsearchExporter implements Exporter {
 
   private void flush() {
     client.flush();
-    controller.updateLastExportedRecordPosition(lastPosition);
+  }
+
+  private void updateLastExportedPosition() {
+    exporterMetadata.setRecordCountersByValueType(recordCounters.getRecordCounters());
+    final var serializeExporterMetadata = serializeExporterMetadata(exporterMetadata);
+    controller.updateLastExportedRecordPosition(lastPosition, serializeExporterMetadata);
+  }
+
+  private byte[] serializeExporterMetadata(final ElasticsearchExporterMetadata metadata) {
+    try {
+      return exporterMetadataObjectMapper.writeValueAsBytes(metadata);
+    } catch (final JsonProcessingException e) {
+      throw new ElasticsearchExporterException("Failed to serialize exporter metadata", e);
+    }
+  }
+
+  private ElasticsearchExporterMetadata deserializeExporterMetadata(final byte[] metadata) {
+    try {
+      return exporterMetadataObjectMapper.readValue(metadata, ElasticsearchExporterMetadata.class);
+    } catch (final IOException e) {
+      throw new ElasticsearchExporterException("Failed to deserialize exporter metadata", e);
+    }
   }
 
   private void createIndexTemplates() {
@@ -214,6 +262,9 @@ public class ElasticsearchExporter implements Exporter {
       }
       if (index.escalation) {
         createValueIndexTemplate(ValueType.ESCALATION);
+      }
+      if (index.signalSubscription) {
+        createValueIndexTemplate(ValueType.SIGNAL_SUBSCRIPTION);
       }
     }
 

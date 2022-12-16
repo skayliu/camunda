@@ -9,14 +9,17 @@ package io.camunda.zeebe.engine.processing;
 
 import static io.camunda.zeebe.protocol.record.intent.DeploymentIntent.CREATE;
 
+import io.camunda.zeebe.dmn.DecisionEngineFactory;
 import io.camunda.zeebe.engine.metrics.JobMetrics;
 import io.camunda.zeebe.engine.metrics.ProcessEngineMetrics;
 import io.camunda.zeebe.engine.processing.bpmn.behavior.BpmnBehaviorsImpl;
+import io.camunda.zeebe.engine.processing.common.DecisionBehavior;
 import io.camunda.zeebe.engine.processing.deployment.DeploymentCreateProcessor;
 import io.camunda.zeebe.engine.processing.deployment.distribute.CompleteDeploymentDistributionProcessor;
 import io.camunda.zeebe.engine.processing.deployment.distribute.DeploymentDistributeProcessor;
 import io.camunda.zeebe.engine.processing.deployment.distribute.DeploymentDistributionCommandSender;
 import io.camunda.zeebe.engine.processing.deployment.distribute.DeploymentRedistributor;
+import io.camunda.zeebe.engine.processing.dmn.EvaluateDecisionProcessor;
 import io.camunda.zeebe.engine.processing.incident.IncidentEventProcessors;
 import io.camunda.zeebe.engine.processing.job.JobEventProcessors;
 import io.camunda.zeebe.engine.processing.message.MessageEventProcessors;
@@ -27,14 +30,15 @@ import io.camunda.zeebe.engine.processing.streamprocessor.TypedRecordProcessors;
 import io.camunda.zeebe.engine.processing.streamprocessor.sideeffect.SideEffectQueue;
 import io.camunda.zeebe.engine.processing.streamprocessor.writers.Writers;
 import io.camunda.zeebe.engine.processing.timer.DueDateTimerChecker;
-import io.camunda.zeebe.engine.state.KeyGenerator;
 import io.camunda.zeebe.engine.state.immutable.ZeebeState;
 import io.camunda.zeebe.engine.state.migration.DbMigrationController;
 import io.camunda.zeebe.engine.state.mutable.MutableZeebeState;
 import io.camunda.zeebe.protocol.impl.record.value.processinstance.ProcessInstanceRecord;
 import io.camunda.zeebe.protocol.record.ValueType;
+import io.camunda.zeebe.protocol.record.intent.DecisionEvaluationIntent;
 import io.camunda.zeebe.protocol.record.intent.DeploymentDistributionIntent;
 import io.camunda.zeebe.protocol.record.intent.DeploymentIntent;
+import io.camunda.zeebe.stream.api.state.KeyGenerator;
 import io.camunda.zeebe.util.FeatureFlags;
 import java.util.function.Consumer;
 
@@ -69,6 +73,9 @@ public final class EngineProcessors {
     final var processEngineMetrics = new ProcessEngineMetrics(zeebeState.getPartitionId());
     final var sideEffectQueue = new SideEffectQueue();
 
+    final var decisionBehavior =
+        new DecisionBehavior(
+            DecisionEngineFactory.createDecisionEngine(), zeebeState, processEngineMetrics);
     final BpmnBehaviorsImpl bpmnBehaviors =
         createBehaviors(
             zeebeState,
@@ -77,7 +84,7 @@ public final class EngineProcessors {
             partitionsCount,
             timerChecker,
             jobMetrics,
-            processEngineMetrics,
+            decisionBehavior,
             sideEffectQueue);
 
     addDeploymentRelatedProcessorAndServices(
@@ -101,6 +108,8 @@ public final class EngineProcessors {
             timerChecker,
             sideEffectQueue);
 
+    addDecisionProcessors(typedRecordProcessors, decisionBehavior, writers, zeebeState);
+
     JobEventProcessors.addJobProcessors(
         typedRecordProcessors,
         zeebeState,
@@ -121,14 +130,14 @@ public final class EngineProcessors {
       final int partitionsCount,
       final DueDateTimerChecker timerChecker,
       final JobMetrics jobMetrics,
-      final ProcessEngineMetrics processEngineMetrics,
+      final DecisionBehavior decisionBehavior,
       final SideEffectQueue sideEffectQueue) {
     return new BpmnBehaviorsImpl(
         sideEffectQueue,
         zeebeState,
         writers,
         jobMetrics,
-        processEngineMetrics,
+        decisionBehavior,
         subscriptionCommandSender,
         partitionsCount,
         timerChecker);
@@ -182,11 +191,7 @@ public final class EngineProcessors {
     // on other partitions DISTRIBUTE command is received and processed
     final DeploymentDistributeProcessor deploymentDistributeProcessor =
         new DeploymentDistributeProcessor(
-            zeebeState.getProcessState(),
-            zeebeState.getMessageStartEventSubscriptionState(),
-            deploymentDistributionCommandSender,
-            writers,
-            keyGenerator);
+            zeebeState, deploymentDistributionCommandSender, writers, keyGenerator);
     typedRecordProcessors.onCommand(
         ValueType.DEPLOYMENT, DeploymentIntent.DISTRIBUTE, deploymentDistributeProcessor);
 
@@ -215,10 +220,20 @@ public final class EngineProcessors {
       final TypedRecordProcessors typedRecordProcessors,
       final Writers writers) {
     MessageEventProcessors.addMessageProcessors(
-        bpmnBehaviors.eventTriggerBehavior(),
-        typedRecordProcessors,
-        zeebeState,
-        subscriptionCommandSender,
-        writers);
+        bpmnBehaviors, typedRecordProcessors, zeebeState, subscriptionCommandSender, writers);
+  }
+
+  private static void addDecisionProcessors(
+      final TypedRecordProcessors typedRecordProcessors,
+      final DecisionBehavior decisionBehavior,
+      final Writers writers,
+      final MutableZeebeState zeebeState) {
+
+    final EvaluateDecisionProcessor evaluateDecisionProcessor =
+        new EvaluateDecisionProcessor(decisionBehavior, zeebeState.getKeyGenerator(), writers);
+    typedRecordProcessors.onCommand(
+        ValueType.DECISION_EVALUATION,
+        DecisionEvaluationIntent.EVALUATE,
+        evaluateDecisionProcessor);
   }
 }

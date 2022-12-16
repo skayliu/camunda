@@ -7,7 +7,6 @@
  */
 package io.camunda.zeebe.backup.s3;
 
-import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
@@ -18,18 +17,17 @@ import io.camunda.zeebe.backup.api.BackupIdentifierWildcard;
 import io.camunda.zeebe.backup.api.BackupStatus;
 import io.camunda.zeebe.backup.api.BackupStatusCode;
 import io.camunda.zeebe.backup.api.BackupStore;
-import io.camunda.zeebe.backup.api.NamedFileSet;
 import io.camunda.zeebe.backup.common.BackupIdentifierImpl;
 import io.camunda.zeebe.backup.common.BackupImpl;
-import io.camunda.zeebe.backup.common.NamedFileSetImpl;
 import io.camunda.zeebe.backup.s3.S3BackupStoreException.BackupDeletionIncomplete;
 import io.camunda.zeebe.backup.s3.S3BackupStoreException.BackupInInvalidStateException;
 import io.camunda.zeebe.backup.s3.S3BackupStoreException.BackupReadException;
 import io.camunda.zeebe.backup.s3.S3BackupStoreException.ManifestParseException;
-import io.camunda.zeebe.backup.s3.manifest.InProgressBackupManifest;
+import io.camunda.zeebe.backup.s3.manifest.FileSet;
 import io.camunda.zeebe.backup.s3.manifest.Manifest;
 import io.camunda.zeebe.backup.s3.manifest.NoBackupManifest;
 import io.camunda.zeebe.backup.s3.manifest.ValidBackupManifest;
+import io.camunda.zeebe.backup.s3.util.AsyncAggregatingSubscriber;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Path;
@@ -37,9 +35,7 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -58,14 +54,13 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
-import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
 /**
  * {@link BackupStore} for S3. Stores all backups in a given bucket.
  *
  * <p>All created object keys are prefixed by the {@link BackupIdentifier}, with the following
- * scheme: {@code partitionId/checkpointId/nodeId}
+ * scheme: {@code basePath/partitionId/checkpointId/nodeId}.
  *
  * <p>Each backup contains:
  *
@@ -85,10 +80,11 @@ public final class S3BackupStore implements BackupStore {
   static final String SEGMENTS_PREFIX = "segments/";
   static final String MANIFEST_OBJECT_KEY = "manifest.json";
   private static final Logger LOG = LoggerFactory.getLogger(S3BackupStore.class);
-  private static final Pattern BACKUP_IDENTIFIER_PATTERN =
-      Pattern.compile("^(?<partitionId>\\d+)/(?<checkpointId>\\d+)/(?<nodeId>\\d+).*");
+  private static final int SCAN_PARALLELISM = 16;
+  private final Pattern backupIdentifierPattern;
   private final S3BackupConfig config;
   private final S3AsyncClient client;
+  private final FileSetManager fileSetManager;
 
   public S3BackupStore(final S3BackupConfig config) {
     this(config, buildClient(config));
@@ -97,10 +93,17 @@ public final class S3BackupStore implements BackupStore {
   public S3BackupStore(final S3BackupConfig config, final S3AsyncClient client) {
     this.config = config;
     this.client = client;
+    fileSetManager = new FileSetManager(client, config);
+    final var basePath = config.basePath();
+    backupIdentifierPattern =
+        Pattern.compile(
+            "^"
+                + basePath.map(base -> base + "/").map(Pattern::quote).orElse("")
+                + "(?<partitionId>\\d+)/(?<checkpointId>\\d+)/(?<nodeId>\\d+).*");
   }
 
-  private static Optional<BackupIdentifier> tryParseKeyAsId(final String key) {
-    final var matcher = BACKUP_IDENTIFIER_PATTERN.matcher(key);
+  private Optional<BackupIdentifier> tryParseKeyAsId(final String key) {
+    final var matcher = backupIdentifierPattern.matcher(key);
     if (matcher.matches()) {
       try {
         final var nodeId = Integer.parseInt(matcher.group("nodeId"));
@@ -124,16 +127,20 @@ public final class S3BackupStore implements BackupStore {
    * BackupIdentifierWildcard#matches(BackupIdentifier id)} to ensure that the listed object
    * matches.
    */
-  private static String wildcardPrefix(final BackupIdentifierWildcard wildcard) {
+  private String wildcardPrefix(final BackupIdentifierWildcard wildcard) {
     //noinspection OptionalGetWithoutIsPresent -- checked by takeWhile
     return Stream.of(wildcard.partitionId(), wildcard.checkpointId(), wildcard.nodeId())
         .takeWhile(Optional::isPresent)
         .map(Optional::get)
         .map(Number::toString)
-        .collect(Collectors.joining("/"));
+        .collect(Collectors.joining("/", config.basePath().map(base -> base + "/").orElse(""), ""));
   }
 
-  public static String objectPrefix(final BackupIdentifier id) {
+  public String objectPrefix(final BackupIdentifier id) {
+    final var base = config.basePath();
+    if (base.isPresent()) {
+      return "%s/%s/%s/%s/".formatted(base.get(), id.partitionId(), id.checkpointId(), id.nodeId());
+    }
     return "%s/%s/%s/".formatted(id.partitionId(), id.checkpointId(), id.nodeId());
   }
 
@@ -174,7 +181,8 @@ public final class S3BackupStore implements BackupStore {
                           updateManifestObject(
                               backup.id(),
                               Manifest::expectInProgress,
-                              InProgressBackupManifest::asCompleted))
+                              inProgress ->
+                                  inProgress.asCompleted(snapshot.join(), segments.join())))
                   .exceptionallyComposeAsync(
                       throwable ->
                           updateManifestObject(
@@ -228,13 +236,11 @@ public final class S3BackupStore implements BackupStore {
         .thenApply(Manifest::expectCompleted)
         .thenComposeAsync(
             manifest ->
-                downloadNamedFileSet(
-                        backupPrefix + SEGMENTS_PREFIX, manifest.segmentFileNames(), targetFolder)
+                fileSetManager
+                    .restore(backupPrefix + SEGMENTS_PREFIX, manifest.segmentFiles(), targetFolder)
                     .thenCombineAsync(
-                        downloadNamedFileSet(
-                            backupPrefix + SNAPSHOT_PREFIX,
-                            manifest.snapshotFileNames(),
-                            targetFolder),
+                        fileSetManager.restore(
+                            backupPrefix + SNAPSHOT_PREFIX, manifest.snapshotFiles(), targetFolder),
                         (segments, snapshot) ->
                             new BackupImpl(id, manifest.descriptor(), snapshot, segments)));
   }
@@ -251,27 +257,6 @@ public final class S3BackupStore implements BackupStore {
   public CompletableFuture<Void> closeAsync() {
     client.close();
     return CompletableFuture.completedFuture(null);
-  }
-
-  private CompletableFuture<NamedFileSet> downloadNamedFileSet(
-      final String sourcePrefix, final Set<String> fileNames, final Path targetFolder) {
-    LOG.debug(
-        "Downloading {} files from prefix {} to {}", fileNames.size(), sourcePrefix, targetFolder);
-    final var downloadedFiles = new ConcurrentHashMap<String, Path>();
-    final CompletableFuture<?>[] futures =
-        fileNames.stream()
-            .map(
-                fileName -> {
-                  final var path = targetFolder.resolve(fileName);
-                  return client
-                      .getObject(
-                          req -> req.bucket(config.bucketName()).key(sourcePrefix + fileName), path)
-                      .thenApply(response -> downloadedFiles.put(fileName, path));
-                })
-            .toArray(CompletableFuture[]::new);
-
-    return CompletableFuture.allOf(futures)
-        .thenApply(ignored -> new NamedFileSetImpl(downloadedFiles));
   }
 
   private CompletableFuture<List<ObjectIdentifier>> listBackupObjects(final BackupIdentifier id) {
@@ -317,7 +302,7 @@ public final class S3BackupStore implements BackupStore {
         .contents()
         .filter(obj -> obj.key().endsWith(MANIFEST_OBJECT_KEY))
         .map(S3Object::key)
-        .map(S3BackupStore::tryParseKeyAsId)
+        .map(this::tryParseKeyAsId)
         .filter(Optional::isPresent)
         .map(Optional::get)
         .filter(wildcard::matches);
@@ -325,7 +310,7 @@ public final class S3BackupStore implements BackupStore {
 
   private CompletableFuture<Collection<Manifest>> readManifestObjects(
       final BackupIdentifierWildcard wildcard) {
-    final var aggregator = new AsyncAggregatingSubscriber<Manifest>(16);
+    final var aggregator = new AsyncAggregatingSubscriber<Manifest>(SCAN_PARALLELISM);
     final var publisher = findBackupIds(wildcard).map(this::readManifestObject);
     publisher.subscribe(aggregator);
 
@@ -343,10 +328,9 @@ public final class S3BackupStore implements BackupStore {
               try {
                 return (Manifest)
                     MAPPER.readValue(response.asInputStream(), ValidBackupManifest.class);
-              } catch (final JsonParseException e) {
-                throw new ManifestParseException("Failed to parse manifest object", e);
               } catch (final IOException e) {
-                throw new BackupReadException("Failed to read manifest object", e);
+                throw new ManifestParseException(
+                    "Failed to read manifest object: %s".formatted(response.asUtf8String()), e);
               }
             })
         .exceptionally(
@@ -397,37 +381,16 @@ public final class S3BackupStore implements BackupStore {
         .thenApply(resp -> manifest);
   }
 
-  private CompletableFuture<Void> saveSnapshotFiles(final Backup backup) {
+  private CompletableFuture<FileSet> saveSnapshotFiles(final Backup backup) {
     LOG.debug("Saving snapshot files for {}", backup.id());
     final var prefix = objectPrefix(backup.id()) + SNAPSHOT_PREFIX;
-
-    final var futures =
-        backup.snapshot().namedFiles().entrySet().stream()
-            .map(
-                snapshotFile ->
-                    saveNamedFile(prefix, snapshotFile.getKey(), snapshotFile.getValue()))
-            .toList();
-
-    return CompletableFuture.allOf(futures.toArray(new CompletableFuture[] {}));
+    return fileSetManager.save(prefix, backup.snapshot());
   }
 
-  private CompletableFuture<Void> saveSegmentFiles(final Backup backup) {
+  private CompletableFuture<FileSet> saveSegmentFiles(final Backup backup) {
     LOG.debug("Saving segment files for {}", backup.id());
     final var prefix = objectPrefix(backup.id()) + SEGMENTS_PREFIX;
-    final var futures =
-        backup.segments().namedFiles().entrySet().stream()
-            .map(segmentFile -> saveNamedFile(prefix, segmentFile.getKey(), segmentFile.getValue()))
-            .toList();
-
-    return CompletableFuture.allOf(futures.toArray(new CompletableFuture[] {}));
-  }
-
-  private CompletableFuture<PutObjectResponse> saveNamedFile(
-      final String prefix, final String fileName, final Path filePath) {
-    LOG.trace("Saving file {}({}) in prefix {}", fileName, filePath, prefix);
-    return client.putObject(
-        put -> put.bucket(config.bucketName()).key(prefix + fileName),
-        AsyncRequestBody.fromFile(filePath));
+    return fileSetManager.save(prefix, backup.segments());
   }
 
   public static S3AsyncClient buildClient(final S3BackupConfig config) {

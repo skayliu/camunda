@@ -42,7 +42,8 @@ public class BlockSequenceBuilder extends AbstractBlockBuilder {
           new CallActivityBlockBuilder.Factory(),
           new UserTaskBlockBuilder.Factory(),
           new ManualTaskBlockBuilder.Factory(),
-          new IntermediateThrowEventBlockBuilder.Factory());
+          new IntermediateThrowEventBlockBuilder.Factory(),
+          new EscalationEventBlockBuilder.Factory());
 
   private final List<BlockBuilder> blockBuilders = new ArrayList<>();
 
@@ -88,8 +89,13 @@ public class BlockSequenceBuilder extends AbstractBlockBuilder {
   public ExecutionPathSegment generateRandomExecutionPath(final ExecutionPathContext context) {
     final ExecutionPathSegment result = new ExecutionPathSegment();
 
-    blockBuilders.forEach(
-        blockBuilder -> result.append(blockBuilder.findRandomExecutionPath(context)));
+    for (final BlockBuilder blockBuilder : blockBuilders) {
+      final var segment = blockBuilder.findRandomExecutionPath(context);
+      result.append(segment);
+      if (result.hasReachedTerminateEndEvent()) {
+        break;
+      }
+    }
 
     return result;
   }

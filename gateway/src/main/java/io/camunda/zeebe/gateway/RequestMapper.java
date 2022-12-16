@@ -95,7 +95,8 @@ public final class RequestMapper {
 
   public static BrokerThrowErrorRequest toThrowErrorRequest(final ThrowErrorRequest grpcRequest) {
     return new BrokerThrowErrorRequest(grpcRequest.getJobKey(), grpcRequest.getErrorCode())
-        .setErrorMessage(grpcRequest.getErrorMessage());
+        .setErrorMessage(grpcRequest.getErrorMessage())
+        .setVariables(ensureJsonSet(grpcRequest.getVariables()));
   }
 
   public static BrokerCompleteJobRequest toCompleteJobRequest(
@@ -188,8 +189,7 @@ public final class RequestMapper {
         return new UnsafeBuffer(MsgPackConverter.convertToMsgPack(value));
       } catch (final RuntimeException e) {
         final var cause = e.getCause();
-        if (cause instanceof JsonParseException) {
-          final var parseException = (JsonParseException) cause;
+        if (cause instanceof final JsonParseException parseException) {
 
           final var descriptiveException =
               new JsonParseException(
@@ -200,6 +200,9 @@ public final class RequestMapper {
 
           rethrowUnchecked(descriptiveException);
           return DocumentValue.EMPTY_DOCUMENT; // bogus return statement
+        } else if (cause instanceof IllegalArgumentException) {
+          rethrowUnchecked(cause);
+          return DocumentValue.EMPTY_DOCUMENT;
         } else {
           throw e;
         }

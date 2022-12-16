@@ -18,7 +18,8 @@ import static org.mockito.Mockito.when;
 import io.camunda.zeebe.broker.transport.backpressure.NoopRequestLimiter;
 import io.camunda.zeebe.broker.transport.backpressure.RequestLimiter;
 import io.camunda.zeebe.gateway.impl.broker.request.BrokerPublishMessageRequest;
-import io.camunda.zeebe.logstreams.log.LogStreamRecordWriter;
+import io.camunda.zeebe.logstreams.log.LogAppendEntry;
+import io.camunda.zeebe.logstreams.log.LogStreamWriter;
 import io.camunda.zeebe.protocol.impl.encoding.ErrorResponse;
 import io.camunda.zeebe.protocol.impl.encoding.ExecuteCommandRequest;
 import io.camunda.zeebe.protocol.impl.encoding.ExecuteCommandResponse;
@@ -37,6 +38,7 @@ import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 public class CommandApiRequestHandlerTest {
   @Rule public final ControlledActorSchedulerRule scheduler = new ControlledActorSchedulerRule();
@@ -45,7 +47,7 @@ public class CommandApiRequestHandlerTest {
   @Before
   public void setup() {
     scheduler.submitActor(handler);
-    handler.addPartition(0, mock(LogStreamRecordWriter.class), new NoopRequestLimiter<>());
+    handler.addPartition(0, mock(LogStreamWriter.class), new NoopRequestLimiter<>());
     scheduler.workUntilDone();
   }
 
@@ -129,7 +131,7 @@ public class CommandApiRequestHandlerTest {
     // given
     final RequestLimiter<Intent> limiter = mock(RequestLimiter.class);
     when(limiter.tryAcquire(anyInt(), anyLong(), any())).thenReturn(false);
-    handler.addPartition(0, mock(LogStreamRecordWriter.class), limiter);
+    handler.addPartition(0, mock(LogStreamWriter.class), limiter);
     scheduler.workUntilDone();
 
     final var request =
@@ -151,9 +153,7 @@ public class CommandApiRequestHandlerTest {
   @Test
   public void shouldWriteToLog() {
     // given
-    final var logWriter = mock(LogStreamRecordWriter.class);
-    when(logWriter.metadataWriter(any())).thenReturn(logWriter);
-    when(logWriter.valueWriter(any())).thenReturn(logWriter);
+    final var logWriter = mock(LogStreamWriter.class);
     handler.addPartition(0, logWriter, new NoopRequestLimiter<>());
     scheduler.workUntilDone();
 
@@ -165,8 +165,7 @@ public class CommandApiRequestHandlerTest {
     handleRequest(request);
 
     // then
-    verify(logWriter).tryWrite();
-    verify(logWriter).reset();
+    verify(logWriter).tryWrite(Mockito.<LogAppendEntry>any());
   }
 
   private CompletableFuture<Either<ErrorResponse, ExecuteCommandResponse>> handleRequest(
